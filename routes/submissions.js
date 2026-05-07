@@ -1808,7 +1808,9 @@ router.get('/:id/eligible-judges', authorize('admin', 'superadmin'), async (req,
       });
     }
 
-    const result = await getEligibleJudges(req.params.id);
+    const result = await getEligibleJudges(req.params.id, {
+      roundId: req.query.roundId || null
+    });
     
     if (!result.success) {
       return res.status(404).json({

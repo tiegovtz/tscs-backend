@@ -111,7 +111,7 @@ const isSubmissionEligibleForRoundChunkSchedule = async (submission, round) => {
   // No configured chunks means no chunk-based restrictions.
   if (!chunks || chunks.length === 0) return true;
 
-  const areaId = submission.level === 'Council'
+  const areaId = round.level === 'Council'
     ? `${submission.region || ''}::${submission.council || ''}`
     : (submission.region || '');
 
@@ -203,7 +203,10 @@ async function assignJudgeToSubmission(submission, options = {}) {
       };
     }
 
-    const areaQuery = buildJudgeAreaQueryByLevel(submission.level, submission.region, submission.council);
+    const assignmentLevel = round.level || submission.level;
+    const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
+
+    const areaQuery = buildJudgeAreaQueryByLevel(assignmentLevel, submission.region, assignmentCouncil);
     if (areaQuery === null) {
       return {
         success: false,
@@ -215,7 +218,7 @@ async function assignJudgeToSubmission(submission, options = {}) {
     const judgeQuery = {
       role: 'judge',
       status: 'active',
-      assignedLevel: submission.level,
+      assignedLevel: assignmentLevel,
       ...areaQuery
     };
 
@@ -229,15 +232,15 @@ async function assignJudgeToSubmission(submission, options = {}) {
       return {
         success: false,
         assignment: null,
-        error: `No active judges found for ${submission.level} level at ${submission.region}${submission.council ? ` - ${submission.council}` : ''} with area of focus "${submissionAreaOfFocus || 'N/A'}"`
+        error: `No active judges found for ${assignmentLevel} level at ${submission.region}${assignmentCouncil ? ` - ${assignmentCouncil}` : ''} with area of focus "${submissionAreaOfFocus || 'N/A'}"`
       };
     }
 
     const locationAssignmentQuery = {
       roundId,
-      level: submission.level,
+      level: assignmentLevel,
       region: submission.region,
-      ...(submission.level === 'Council' ? { council: submission.council } : {})
+      ...(assignmentLevel === 'Council' ? { council: assignmentCouncil } : {})
     };
 
     const existingAssignments = await SubmissionAssignment.find(locationAssignmentQuery).select('judgeId');
@@ -271,9 +274,9 @@ async function assignJudgeToSubmission(submission, options = {}) {
         roundId,
         submissionId: submission._id,
         judgeId: selectedJudge._id,
-        level: submission.level,
+        level: assignmentLevel,
         region: submission.region,
-        council: submission.council || null,
+        council: assignmentCouncil || null,
         judgeNotified: false
       });
     } catch (error) {
@@ -303,9 +306,9 @@ async function assignJudgeToSubmission(submission, options = {}) {
       teacherName: submission.teacherName,
       subject: submission.subject,
       areaOfFocus: submission.areaOfFocus,
-      level: submission.level,
+      level: assignmentLevel,
       region: submission.region,
-      council: submission.council
+      council: assignmentCouncil
     }).catch((error) => {
       console.error('Error sending judge assignment notification:', error);
     });
@@ -572,20 +575,37 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       };
     }
 
+    const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
+    if (!roundResolution.round) {
+      return { success: false, assignment: null, error: 'No active or ended round found for this submission level' };
+    }
+
+    const round = roundResolution.round;
+    const assignmentLevel = round.level || submission.level;
+    const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
+    const chunkEligible = await isSubmissionEligibleForRoundChunkSchedule(submission, round);
+    if (!chunkEligible) {
+      return {
+        success: false,
+        assignment: null,
+        error: 'Submission area is not active for assignment in this round chunk schedule'
+      };
+    }
+
     const judge = await User.findById(judgeId);
     if (!judge || judge.role !== 'judge' || judge.status !== 'active') {
       return { success: false, assignment: null, error: 'Invalid or inactive judge' };
     }
 
-    if (judge.assignedLevel !== submission.level) {
-      return { success: false, assignment: null, error: 'Judge level does not match submission level' };
+    if (judge.assignedLevel !== assignmentLevel) {
+      return { success: false, assignment: null, error: 'Judge level does not match round assignment level' };
     }
 
-    if (submission.level === 'Council') {
-      if (!locationsEqual(judge.assignedRegion, submission.region) || !locationsEqual(judge.assignedCouncil, submission.council)) {
-        return { success: false, assignment: null, error: 'Judge location does not match submission location' };
+    if (assignmentLevel === 'Council') {
+      if (!locationsEqual(judge.assignedRegion, submission.region) || !locationsEqual(judge.assignedCouncil, assignmentCouncil)) {
+        return { success: false, assignment: null, error: 'Judge location does not match submission council scope' };
       }
-    } else if (submission.level === 'Regional') {
+    } else if (assignmentLevel === 'Regional') {
       if (!locationsEqual(judge.assignedRegion, submission.region)) {
         return { success: false, assignment: null, error: 'Judge region does not match submission region' };
       }
@@ -595,20 +615,6 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       return { success: false, assignment: null, error: 'Judge area of focus does not match submission area of focus' };
     }
 
-    const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
-    if (!roundResolution.round) {
-      return { success: false, assignment: null, error: 'No active or ended round found for this submission level' };
-    }
-
-    const round = roundResolution.round;
-    const chunkEligible = await isSubmissionEligibleForRoundChunkSchedule(submission, round);
-    if (!chunkEligible) {
-      return {
-        success: false,
-        assignment: null,
-        error: 'Submission area is not active for assignment in this round chunk schedule'
-      };
-    }
     if (!submission.roundId || String(submission.roundId) !== String(round._id)) {
       await Submission.updateOne({ _id: submissionId }, { $set: { roundId: round._id } });
       submission.roundId = round._id;
@@ -633,9 +639,9 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
           roundId: round._id,
           submissionId,
           judgeId,
-          level: submission.level,
+          level: assignmentLevel,
           region: submission.region,
-          council: submission.council || null,
+          council: assignmentCouncil || null,
           judgeNotified: false
         });
       } catch (error) {
@@ -661,9 +667,9 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       teacherName: submission.teacherName,
       subject: submission.subject,
       areaOfFocus: submission.areaOfFocus,
-      level: submission.level,
+      level: assignmentLevel,
       region: submission.region,
-      council: submission.council
+      council: assignmentCouncil
     }).catch((error) => {
       console.error('Error sending judge assignment notification:', error);
     });
@@ -687,15 +693,27 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
 /**
  * Get eligible judges for a submission.
  */
-async function getEligibleJudges(submissionId) {
+async function getEligibleJudges(submissionId, options = {}) {
   try {
-    const submission = await Submission.findById(submissionId).select('_id level region council status disqualified areaOfFocus');
+    const submission = await Submission.findById(submissionId).select('_id year level roundId region council status disqualified areaOfFocus');
 
     if (!submission) {
       return { success: false, judges: [], error: 'Submission not found' };
     }
 
-    if (submission.level === 'National') {
+    const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
+    if (!roundResolution.round) {
+      return {
+        success: true,
+        judges: [],
+        message: 'No active or ended round found for this submission level'
+      };
+    }
+
+    const assignmentLevel = roundResolution.round.level || submission.level;
+    const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
+
+    if (assignmentLevel === 'National') {
       return {
         success: true,
         judges: [],
@@ -711,7 +729,7 @@ async function getEligibleJudges(submissionId) {
       };
     }
 
-    const areaQuery = buildJudgeAreaQueryByLevel(submission.level, submission.region, submission.council);
+    const areaQuery = buildJudgeAreaQueryByLevel(assignmentLevel, submission.region, assignmentCouncil);
     if (areaQuery === null) {
       return {
         success: true,
@@ -723,7 +741,7 @@ async function getEligibleJudges(submissionId) {
     const judgeQuery = {
       role: 'judge',
       status: 'active',
-      assignedLevel: submission.level,
+      assignedLevel: assignmentLevel,
       ...areaQuery
     };
 
