@@ -1709,8 +1709,10 @@ router.get('/:id/judge-progress', async (req, res) => {
     };
 
     const requestedRegion = normalize(req.query.region);
-    const requestedCouncil = normalize(req.query.council);
+    const requestedCouncilRaw = normalize(req.query.council);
     const requestedGroupBy = normalize(req.query.groupBy).toLowerCase();
+    const isCouncilRound = round.level === 'Council';
+    const requestedCouncil = isCouncilRound ? requestedCouncilRaw : '';
 
     if (requestedCouncil && !requestedRegion) {
       return res.status(400).json({
@@ -1720,13 +1722,16 @@ router.get('/:id/judge-progress', async (req, res) => {
     }
 
     const scopedRegion = requestedRegion || normalize(round.region);
-    const scopedCouncil = requestedCouncil || normalize(round.council);
+    const scopedCouncil = isCouncilRound ? (requestedCouncil || normalize(round.council)) : '';
     const scopeRegionRegex = toExactRegex(scopedRegion);
     const scopeCouncilRegex = toExactRegex(scopedCouncil);
 
-    const groupBy = ['regions', 'councils'].includes(requestedGroupBy)
+    const requestedGrouping = ['regions', 'councils'].includes(requestedGroupBy)
       ? requestedGroupBy
       : (scopedCouncil || scopedRegion ? 'councils' : 'regions');
+    const groupBy = isCouncilRound
+      ? requestedGrouping
+      : 'regions';
 
     const buildAreaKey = (submissionOrAssignment) => {
       const region = submissionOrAssignment?.region ? String(submissionOrAssignment.region).trim() : '';
@@ -1786,7 +1791,7 @@ router.get('/:id/judge-progress', async (req, res) => {
           isDeleted: { $ne: true }
         };
     if (scopeRegionRegex) submissionQuery.region = scopeRegionRegex;
-    if (scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
+    if (isCouncilRound && scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
 
     const allSubmissions = await Submission.find(submissionQuery);
     const allSubmissionIds = allSubmissions.map((submission) => submission._id);
@@ -2096,7 +2101,7 @@ router.get('/:id/judge-progress', async (req, res) => {
       locationContext: {
         groupBy,
         region: scopedRegion || null,
-        council: scopedCouncil || null,
+        council: isCouncilRound ? (scopedCouncil || null) : null,
         dataScope: hasSnapshotContext ? 'snapshot' : (roundScopedSubmissionExists ? 'roundId' : 'legacy-year-level')
       }
     });
@@ -2159,11 +2164,13 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     };
 
     const requestedRegion = normalize(req.query.region);
-    const requestedCouncil = normalize(req.query.council);
+    const requestedCouncilRaw = normalize(req.query.council);
     const requestedAreaOfFocus = normalize(req.query.areaOfFocus);
     const requestedGroupBy = normalize(req.query.groupBy).toLowerCase();
     const page = parsePositiveInt(req.query.page, 1);
     const limit = parsePositiveInt(req.query.limit, 20);
+    const isCouncilRound = round.level === 'Council';
+    const requestedCouncil = isCouncilRound ? requestedCouncilRaw : '';
 
     if (requestedCouncil && !requestedRegion) {
       return res.status(400).json({
@@ -2173,14 +2180,15 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     }
 
     const scopedRegion = requestedRegion || normalize(round.region);
-    const scopedCouncil = requestedCouncil || normalize(round.council);
+    const scopedCouncil = isCouncilRound ? (requestedCouncil || normalize(round.council)) : '';
     const scopedAreaOfFocus = requestedAreaOfFocus;
     const scopeRegionRegex = toExactRegex(scopedRegion);
     const scopeCouncilRegex = toExactRegex(scopedCouncil);
     const scopeAreaOfFocusRegex = toExactRegex(scopedAreaOfFocus);
-    const groupBy = ['regions', 'councils'].includes(requestedGroupBy)
+    const requestedGrouping = ['regions', 'councils'].includes(requestedGroupBy)
       ? requestedGroupBy
       : (scopedCouncil || scopedRegion ? 'councils' : 'regions');
+    const groupBy = isCouncilRound ? requestedGrouping : 'regions';
 
     const buildAreaKey = (record, targetGrouping = groupBy) => {
       const region = record?.region ? String(record.region).trim() : '';
@@ -2240,7 +2248,7 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
             isDeleted: { $ne: true }
           };
     if (scopeRegionRegex) submissionQuery.region = scopeRegionRegex;
-    if (scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
+    if (isCouncilRound && scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
     if (scopeAreaOfFocusRegex) submissionQuery.areaOfFocus = scopeAreaOfFocusRegex;
 
     const allSubmissions = await Submission.find(submissionQuery).sort({ createdAt: -1 });
@@ -2339,30 +2347,29 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     const distribution = [...distributionMap.values()]
       .sort((a, b) => b.unassignedSubmissions - a.unassignedSubmissions);
 
-    const councilTotalsMap = new Map();
+    const childGrouping = isCouncilRound ? 'councils' : 'regions';
+    const childTotalsMap = new Map();
     for (const submission of allSubmissions) {
-      const key = buildAreaKey(submission, 'councils');
+      const key = buildAreaKey(submission, childGrouping);
       if (!key) continue;
-      const current = councilTotalsMap.get(key) || 0;
-      councilTotalsMap.set(key, current + 1);
+      childTotalsMap.set(key, (childTotalsMap.get(key) || 0) + 1);
     }
 
-    const councilUnassignedMap = new Map();
+    const childUnassignedMap = new Map();
     for (const submission of unassignedSubmissions) {
-      const key = buildAreaKey(submission, 'councils');
+      const key = buildAreaKey(submission, childGrouping);
       if (!key) continue;
-      const current = councilUnassignedMap.get(key) || 0;
-      councilUnassignedMap.set(key, current + 1);
+      childUnassignedMap.set(key, (childUnassignedMap.get(key) || 0) + 1);
     }
 
-    const councilKeys = [...new Set([
-      ...councilTotalsMap.keys(),
-      ...councilUnassignedMap.keys()
+    const childKeys = [...new Set([
+      ...childTotalsMap.keys(),
+      ...childUnassignedMap.keys()
     ])];
 
     const councilAdminMap = new Map();
-    if (councilKeys.length > 0) {
-      const adminScopeClauses = councilKeys.map((key) => {
+    if (childGrouping === 'councils' && childKeys.length > 0) {
+      const adminScopeClauses = childKeys.map((key) => {
         const [region, council] = String(key).split('::');
         return { adminRegion: region, adminCouncil: council };
       });
@@ -2381,7 +2388,7 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     }
 
     const regionalAdminMap = new Map();
-    if (round.level === 'Regional') {
+    if (childGrouping === 'regions') {
       const regionSet = new Set(
         allSubmissions
           .map((submission) => String(submission.region || '').trim())
@@ -2403,18 +2410,34 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
       }
     }
 
-    const children = councilKeys
+    const children = childKeys
       .map((key) => {
-        const [region, council] = String(key).split('::');
-        const unassignedCount = councilUnassignedMap.get(key) || 0;
-        const totalCount = councilTotalsMap.get(key) || 0;
+        const unassignedCount = childUnassignedMap.get(key) || 0;
+        const totalCount = childTotalsMap.get(key) || 0;
         const assignedEvaluationCount = Math.max(totalCount - unassignedCount, 0);
-        const adminName = councilAdminMap.get(String(key).toLowerCase()) || null;
+
+        if (childGrouping === 'councils') {
+          const [region, council] = String(key).split('::');
+          const adminName = councilAdminMap.get(String(key).toLowerCase()) || null;
+          return {
+            areaId: key,
+            areaLabel: `${region} - ${council}`,
+            region,
+            council,
+            totalSubmissions: totalCount,
+            assignedEvaluationCount,
+            unassignedSubmissions: unassignedCount,
+            adminName
+          };
+        }
+
+        const region = String(key);
+        const adminName = regionalAdminMap.get(region.toLowerCase()) || null;
         return {
           areaId: key,
-          areaLabel: `${region} - ${council}`,
+          areaLabel: region,
           region,
-          council,
+          council: null,
           totalSubmissions: totalCount,
           assignedEvaluationCount,
           unassignedSubmissions: unassignedCount,
@@ -2462,7 +2485,7 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
       locationContext: {
         groupBy,
         region: scopedRegion || null,
-        council: scopedCouncil || null,
+        council: isCouncilRound ? (scopedCouncil || null) : null,
         areaOfFocus: scopedAreaOfFocus || null,
         dataScope: hasSnapshotContext ? 'snapshot' : (roundScopedSubmissionExists ? 'roundId' : 'legacy-year-level')
       },

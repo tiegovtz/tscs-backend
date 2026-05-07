@@ -18,6 +18,22 @@ const isDuplicateKeyError = (error) => {
   return Boolean(error && (error.code === 11000 || error?.cause?.code === 11000));
 };
 
+const normalizeAreaOfFocus = (value) => String(value || '')
+  .normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-zA-Z0-9]+/g, ' ')
+  .trim()
+  .toLowerCase();
+
+const judgeMatchesAreaOfFocus = (judge, submissionAreaOfFocus) => {
+  const normalizedSubmissionAreaOfFocus = normalizeAreaOfFocus(submissionAreaOfFocus);
+  if (!normalizedSubmissionAreaOfFocus) return true;
+  if (!Array.isArray(judge?.areasOfFocus) || judge.areasOfFocus.length === 0) return false;
+  return judge.areasOfFocus.some(
+    (focus) => normalizeAreaOfFocus(focus) === normalizedSubmissionAreaOfFocus
+  );
+};
+
 const buildSubmissionAreaQueryByLevel = (level, region, council) => {
   if (level === 'Council') {
     return { region, council };
@@ -203,12 +219,17 @@ async function assignJudgeToSubmission(submission, options = {}) {
       ...areaQuery
     };
 
-    const availableJudges = await User.find(judgeQuery).select('_id name email');
-    if (availableJudges.length === 0) {
+    const availableJudges = await User.find(judgeQuery).select('_id name email areasOfFocus');
+    const submissionAreaOfFocus = submission.areaOfFocus || '';
+    const scopedAvailableJudges = availableJudges.filter((judge) =>
+      judgeMatchesAreaOfFocus(judge, submissionAreaOfFocus)
+    );
+
+    if (scopedAvailableJudges.length === 0) {
       return {
         success: false,
         assignment: null,
-        error: `No active judges found for ${submission.level} level at ${submission.region}${submission.council ? ` - ${submission.council}` : ''}`
+        error: `No active judges found for ${submission.level} level at ${submission.region}${submission.council ? ` - ${submission.council}` : ''} with area of focus "${submissionAreaOfFocus || 'N/A'}"`
       };
     }
 
@@ -222,7 +243,7 @@ async function assignJudgeToSubmission(submission, options = {}) {
     const existingAssignments = await SubmissionAssignment.find(locationAssignmentQuery).select('judgeId');
 
     const assignmentCounts = {};
-    availableJudges.forEach((judge) => {
+    scopedAvailableJudges.forEach((judge) => {
       assignmentCounts[judge._id.toString()] = 0;
     });
 
@@ -233,10 +254,10 @@ async function assignJudgeToSubmission(submission, options = {}) {
       }
     });
 
-    let selectedJudge = availableJudges[0];
+    let selectedJudge = scopedAvailableJudges[0];
     let minCount = assignmentCounts[selectedJudge._id.toString()];
 
-    for (const judge of availableJudges) {
+    for (const judge of scopedAvailableJudges) {
       const count = assignmentCounts[judge._id.toString()];
       if (count < minCount) {
         minCount = count;
@@ -570,6 +591,10 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       }
     }
 
+    if (!judgeMatchesAreaOfFocus(judge, submission.areaOfFocus || '')) {
+      return { success: false, assignment: null, error: 'Judge area of focus does not match submission area of focus' };
+    }
+
     const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
     if (!roundResolution.round) {
       return { success: false, assignment: null, error: 'No active or ended round found for this submission level' };
@@ -664,7 +689,7 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
  */
 async function getEligibleJudges(submissionId) {
   try {
-    const submission = await Submission.findById(submissionId).select('_id level region council status disqualified');
+    const submission = await Submission.findById(submissionId).select('_id level region council status disqualified areaOfFocus');
 
     if (!submission) {
       return { success: false, judges: [], error: 'Submission not found' };
@@ -703,10 +728,14 @@ async function getEligibleJudges(submissionId) {
     };
 
     const judges = await User.find(judgeQuery)
-      .select('_id name email username assignedLevel assignedRegion assignedCouncil')
+      .select('_id name email username assignedLevel assignedRegion assignedCouncil areasOfFocus')
       .sort({ name: 1 });
 
-    return { success: true, judges };
+    const eligibleJudges = judges.filter((judge) =>
+      judgeMatchesAreaOfFocus(judge, submission.areaOfFocus || '')
+    );
+
+    return { success: true, judges: eligibleJudges };
   } catch (error) {
     console.error('Error getting eligible judges:', error);
     return {
