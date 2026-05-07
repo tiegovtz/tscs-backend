@@ -52,6 +52,13 @@ const protect = async (req, res, next) => {
 
       next();
     } catch (error) {
+      if (error?.name === 'TokenExpiredError') {
+        return res.status(401).json({
+          success: false,
+          message: 'Not authorized, token expired'
+        });
+      }
+
       return res.status(401).json({
         success: false,
         message: 'Not authorized, token failed'
@@ -89,4 +96,3 @@ const authorizeNationalAdminOrSuperadmin = (req, res, next) => {
 };
 
 module.exports = { protect, authorize, authorizeNationalAdminOrSuperadmin };
-
