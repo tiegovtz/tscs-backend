@@ -89,7 +89,6 @@ const ensureSubmissionActionableForAssignment = async (submission, round) => {
     submission.status !== 'eliminated'
     || !round
     || String(submission.level || '') !== String(round.level || '')
-    || !submission.promotedFromRoundId
   ) {
     return { actionable: false, status: submission.status };
   }
@@ -97,9 +96,12 @@ const ensureSubmissionActionableForAssignment = async (submission, round) => {
   const [promotionIntoCurrentLevel, currentLevelDecision] = await Promise.all([
     PromotionRecord.findOne({
       submissionId: submission._id,
-      fromRoundId: submission.promotedFromRoundId,
-      toLevel: submission.level,
-      status: 'promoted'
+      status: 'promoted',
+      $or: [
+        { toLevel: submission.level },
+        { toRoundId: round._id },
+        ...(submission.promotedFromRoundId ? [{ fromRoundId: submission.promotedFromRoundId }] : [])
+      ]
     }).select('_id'),
     PromotionRecord.findOne({
       submissionId: submission._id,
@@ -108,7 +110,14 @@ const ensureSubmissionActionableForAssignment = async (submission, round) => {
     }).select('_id')
   ]);
 
-  if (!promotionIntoCurrentLevel || currentLevelDecision) {
+  if (currentLevelDecision) {
+    return { actionable: false, status: submission.status };
+  }
+
+  const isPromotedIntoCurrentRound = Boolean(promotionIntoCurrentLevel)
+    || (submission.promotedFromRoundId && String(submission.level || '') !== 'Council')
+    || (String(round.status || '') === 'active' && ['Regional', 'National'].includes(String(round.level || '')));
+  if (!isPromotedIntoCurrentRound) {
     return { actionable: false, status: submission.status };
   }
 
