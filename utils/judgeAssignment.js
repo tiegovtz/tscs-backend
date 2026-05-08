@@ -30,10 +30,26 @@ const normalizeAreaOfFocus = (value) => String(getCanonicalAreaOfFocusLabel(valu
 const judgeMatchesAreaOfFocus = (judge, submissionAreaOfFocus) => {
   const normalizedSubmissionAreaOfFocus = normalizeAreaOfFocus(submissionAreaOfFocus);
   if (!normalizedSubmissionAreaOfFocus) return true;
-  if (!Array.isArray(judge?.areasOfFocus) || judge.areasOfFocus.length === 0) return false;
+  if (!Array.isArray(judge?.areasOfFocus) || judge.areasOfFocus.length === 0) return true;
   return judge.areasOfFocus.some(
     (focus) => normalizeAreaOfFocus(focus) === normalizedSubmissionAreaOfFocus
   );
+};
+
+const buildEligibleJudgeEmptyMessage = ({ assignmentLevel, submission, totalScopedJudges, eligibleCount }) => {
+  if (eligibleCount > 0) {
+    return `${eligibleCount} eligible judge(s) found`;
+  }
+
+  const location = assignmentLevel === 'Council'
+    ? `${submission.region || 'Unknown region'} - ${submission.council || 'Unknown council'}`
+    : (submission.region || 'Unknown region');
+
+  if (totalScopedJudges === 0) {
+    return `No active ${assignmentLevel} judges found for ${location}`;
+  }
+
+  return `No active ${assignmentLevel} judges in ${location} match area of focus "${submission.areaOfFocus || 'N/A'}"`;
 };
 
 const buildSubmissionAreaQueryByLevel = (level, region, council) => {
@@ -816,7 +832,23 @@ async function getEligibleJudges(submissionId, options = {}) {
       judgeMatchesAreaOfFocus(judge, submission.areaOfFocus || '')
     );
 
-    return { success: true, judges: eligibleJudges };
+    return {
+      success: true,
+      judges: eligibleJudges,
+      message: buildEligibleJudgeEmptyMessage({
+        assignmentLevel,
+        submission,
+        totalScopedJudges: judges.length,
+        eligibleCount: eligibleJudges.length
+      }),
+      debug: process.env.NODE_ENV === 'development' ? {
+        assignmentLevel,
+        submissionRegion: submission.region || null,
+        submissionCouncil: submission.council || null,
+        scopedJudges: judges.length,
+        areaMatchedJudges: eligibleJudges.length
+      } : undefined
+    };
   } catch (error) {
     console.error('Error getting eligible judges:', error);
     return {
