@@ -3,6 +3,7 @@ const Submission = require('../models/Submission');
 const SubmissionAssignment = require('../models/SubmissionAssignment');
 const CompetitionRound = require('../models/CompetitionRound');
 const RoundChunk = require('../models/RoundChunk');
+const RoundSnapshot = require('../models/RoundSnapshot');
 const PromotionRecord = require('../models/PromotionRecord');
 const notificationService = require('../services/notificationService');
 const {
@@ -60,6 +61,115 @@ const buildSubmissionAreaQueryByLevel = (level, region, council) => {
     return { region };
   }
   return {};
+};
+
+const buildRoundAreaDescriptor = (round, submission) => {
+  const level = round?.level || submission?.level;
+  if (level === 'Council') {
+    return {
+      areaType: 'council',
+      areaId: `${submission.region || 'unknown'}::${submission.council || 'unknown'}`,
+      region: submission.region || null,
+      council: submission.council || null
+    };
+  }
+  if (level === 'Regional') {
+    return {
+      areaType: 'region',
+      areaId: submission.region || 'unknown',
+      region: submission.region || null,
+      council: null
+    };
+  }
+  return {
+    areaType: 'national',
+    areaId: 'national',
+    region: null,
+    council: null
+  };
+};
+
+const ensureSubmissionInRoundSnapshot = async (submission, round) => {
+  if (!submission || !round || !['active', 'ended'].includes(round.status)) {
+    return { attached: false, reason: 'round_not_actionable' };
+  }
+
+  const submissionId = String(submission._id);
+  const snapshot = await RoundSnapshot.findOne({ roundId: round._id });
+  const existingIds = new Set([
+    ...((round.pendingSubmissionsSnapshot || []).map((id) => String(id))),
+    ...((snapshot?.submissionIds || []).map((id) => String(id)))
+  ]);
+
+  if (existingIds.has(submissionId)) {
+    if (!submission.roundId || String(submission.roundId) !== String(round._id)) {
+      await Submission.updateOne({ _id: submission._id }, { $set: { roundId: round._id } });
+      submission.roundId = round._id;
+    }
+    return { attached: false, alreadyExists: true };
+  }
+
+  const descriptor = buildRoundAreaDescriptor(round, submission);
+  const areaMap = new Map();
+  const baseAreas = Array.isArray(snapshot?.activeAreas) && snapshot.activeAreas.length > 0
+    ? snapshot.activeAreas
+    : (round.activeAreas || []);
+
+  for (const area of baseAreas) {
+    if (!area?.areaId) continue;
+    areaMap.set(String(area.areaId), {
+      areaType: area.areaType,
+      areaId: area.areaId,
+      region: area.region || null,
+      council: area.council || null,
+      submissionCount: Number(area.submissionCount) || 0
+    });
+  }
+
+  const currentArea = areaMap.get(descriptor.areaId) || {
+    areaType: descriptor.areaType,
+    areaId: descriptor.areaId,
+    region: descriptor.region,
+    council: descriptor.council,
+    submissionCount: 0
+  };
+  currentArea.submissionCount += 1;
+  areaMap.set(descriptor.areaId, currentArea);
+
+  const updatedIds = [...existingIds, submissionId];
+  const updatedSnapshot = await RoundSnapshot.findOneAndUpdate(
+    { roundId: round._id },
+    {
+      roundId: round._id,
+      year: round.year,
+      level: round.level,
+      submissionIds: updatedIds,
+      activeAreas: [...areaMap.values()],
+      totalSubmissions: updatedIds.length,
+      frozenAt: snapshot?.frozenAt || round.snapshotCreatedAt || new Date(),
+      metadata: {
+        ...(snapshot?.metadata || {}),
+        lastManualAssignmentAttachmentAt: new Date(),
+        lastManualAssignmentSubmissionId: submission._id
+      }
+    },
+    { upsert: true, new: true, runValidators: true }
+  );
+
+  await Submission.updateOne({ _id: submission._id }, { $set: { roundId: round._id } });
+  submission.roundId = round._id;
+
+  round.pendingSubmissionsSnapshot = updatedSnapshot.submissionIds || [];
+  round.activeAreas = updatedSnapshot.activeAreas || [];
+  if (!round.activationSnapshotId) {
+    round.activationSnapshotId = updatedSnapshot._id;
+  }
+  if (!round.snapshotCreatedAt) {
+    round.snapshotCreatedAt = new Date();
+  }
+  await round.save();
+
+  return { attached: true, snapshot: updatedSnapshot };
 };
 
 const buildJudgeAreaQueryByLevel = (level, region, council) => {
@@ -709,6 +819,8 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       await Submission.updateOne({ _id: submissionId }, { $set: { roundId: round._id } });
       submission.roundId = round._id;
     }
+
+    await ensureSubmissionInRoundSnapshot(submission, round);
 
     const assignmentQuery = {
       roundId: round._id,

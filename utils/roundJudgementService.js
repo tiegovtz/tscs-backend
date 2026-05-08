@@ -1305,6 +1305,84 @@ const activateDueChunksForRound = async (roundOrId, options = {}) => {
   };
 };
 
+const ensureAssignedSubmissionInRoundSnapshot = async (submission, round) => {
+  if (!submission || !round || !['active', 'ended'].includes(round.status)) return false;
+
+  const assignment = await SubmissionAssignment.findOne({
+    roundId: round._id,
+    submissionId: submission._id
+  }).select('_id');
+  if (!assignment) return false;
+
+  const submissionId = String(submission._id);
+  const snapshot = await getRoundSnapshot(round._id);
+  const existingIds = new Set([
+    ...((round.pendingSubmissionsSnapshot || []).map((id) => String(id))),
+    ...((snapshot?.submissionIds || []).map((id) => String(id)))
+  ]);
+  if (existingIds.has(submissionId)) return true;
+
+  const descriptor = getSubmissionAreaDescriptor(round.level, submission);
+  const areaMap = new Map();
+  const baseAreas = Array.isArray(snapshot?.activeAreas) && snapshot.activeAreas.length > 0
+    ? snapshot.activeAreas
+    : (round.activeAreas || []);
+
+  for (const area of baseAreas) {
+    if (!area?.areaId) continue;
+    areaMap.set(String(area.areaId), {
+      areaType: area.areaType,
+      areaId: area.areaId,
+      region: area.region || null,
+      council: area.council || null,
+      submissionCount: Number(area.submissionCount) || 0
+    });
+  }
+
+  const currentArea = areaMap.get(descriptor.areaId) || {
+    areaType: descriptor.areaType,
+    areaId: descriptor.areaId,
+    region: descriptor.region,
+    council: descriptor.council,
+    submissionCount: 0
+  };
+  currentArea.submissionCount += 1;
+  areaMap.set(descriptor.areaId, currentArea);
+
+  const updatedIds = [...existingIds, submissionId];
+  const updatedSnapshot = await RoundSnapshot.findOneAndUpdate(
+    { roundId: round._id },
+    {
+      roundId: round._id,
+      year: round.year,
+      level: round.level,
+      submissionIds: updatedIds,
+      activeAreas: [...areaMap.values()],
+      totalSubmissions: updatedIds.length,
+      frozenAt: snapshot?.frozenAt || round.snapshotCreatedAt || new Date(),
+      metadata: {
+        ...(snapshot?.metadata || {}),
+        lastEvaluationRepairAt: new Date(),
+        lastEvaluationRepairSubmissionId: submission._id
+      }
+    },
+    { upsert: true, new: true, runValidators: true }
+  );
+
+  await Submission.updateOne({ _id: submission._id }, { $set: { roundId: round._id } });
+  round.pendingSubmissionsSnapshot = updatedSnapshot.submissionIds || [];
+  round.activeAreas = updatedSnapshot.activeAreas || [];
+  if (!round.activationSnapshotId) {
+    round.activationSnapshotId = updatedSnapshot._id;
+  }
+  if (!round.snapshotCreatedAt) {
+    round.snapshotCreatedAt = new Date();
+  }
+  await round.save();
+
+  return true;
+};
+
 const getRoundBySubmissionForEvaluation = async (submission) => {
   const context = await resolveSubmissionRoundContext(submission, {
     includeHistorical: false,
@@ -1317,14 +1395,12 @@ const getRoundBySubmissionForEvaluation = async (submission) => {
   }
 
   const snapshot = await getRoundSnapshot(round._id);
-  if (!snapshot) {
-    return null;
-  }
 
   const submissionId = String(submission._id);
-  const inSnapshot = (snapshot.submissionIds || []).some((id) => String(id) === submissionId);
+  const inSnapshot = (snapshot?.submissionIds || []).some((id) => String(id) === submissionId);
   if (!inSnapshot) {
-    return null;
+    const repaired = await ensureAssignedSubmissionInRoundSnapshot(submission, round);
+    return repaired ? round : null;
   }
 
   return round;
