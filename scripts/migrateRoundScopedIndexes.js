@@ -32,6 +32,7 @@ async function run() {
 
     await dropIndexIfExists(Evaluation.collection, 'submissionId_1_judgeId_1');
     await dropIndexIfExists(SubmissionAssignment.collection, 'submissionId_1');
+    await dropIndexIfExists(SubmissionAssignment.collection, 'roundId_1_submissionId_1');
 
     await Evaluation.syncIndexes();
     await SubmissionAssignment.syncIndexes();

@@ -855,7 +855,7 @@ const getSubmissionAreaDescriptor = (level, submission) => {
 };
 
 const assignRoundSubmissionsToJudges = async (round, submissions) => {
-  if (!['Council', 'Regional'].includes(round.level)) {
+  if (!['Council', 'Regional', 'National'].includes(round.level)) {
     return { assigned: 0, unassigned: 0 };
   }
 
@@ -873,9 +873,54 @@ const assignRoundSubmissionsToJudges = async (round, submissions) => {
     isDeleted: { $ne: true },
     assignedLevel: round.level
   };
-  const judges = await User.find(judgeQuery).select('_id assignedRegion assignedCouncil');
+  const judges = await User.find(judgeQuery).select('_id assignedRegion assignedCouncil areasOfFocus');
   if (judges.length === 0) {
     return { assigned: 0, unassigned: submissions.length };
+  }
+
+  if (round.level === 'National') {
+    const submissionIds = assignableSubmissions.map((submission) => submission._id);
+    const existingAssignments = await SubmissionAssignment.find({
+      roundId: round._id,
+      submissionId: { $in: submissionIds }
+    }).select('submissionId judgeId');
+
+    const existingAssignmentSet = new Set(
+      existingAssignments.map((assignment) => `${assignment.submissionId}:${assignment.judgeId}`)
+    );
+    const newAssignments = [];
+
+    for (const submission of assignableSubmissions) {
+      const submissionAreaOfFocus = normalizeAreaOfFocus(submission.areaOfFocus || '');
+      for (const judge of judges) {
+        const judgeAreas = Array.isArray(judge.areasOfFocus) ? judge.areasOfFocus : [];
+        if (
+          submissionAreaOfFocus
+          && judgeAreas.length > 0
+          && !judgeAreas.some((focus) => matchesAreaOfFocus(focus, submissionAreaOfFocus))
+        ) {
+          continue;
+        }
+        const key = `${submission._id}:${judge._id}`;
+        if (existingAssignmentSet.has(key)) continue;
+        newAssignments.push({
+          roundId: round._id,
+          submissionId: submission._id,
+          judgeId: judge._id,
+          level: round.level,
+          region: submission.region || null,
+          council: null,
+          judgeNotified: false
+        });
+        existingAssignmentSet.add(key);
+      }
+    }
+
+    if (newAssignments.length > 0) {
+      await SubmissionAssignment.insertMany(newAssignments, { ordered: false });
+    }
+
+    return { assigned: newAssignments.length, unassigned: 0 };
   }
 
   const judgesByArea = new Map();

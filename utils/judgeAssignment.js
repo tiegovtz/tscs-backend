@@ -44,7 +44,9 @@ const buildEligibleJudgeEmptyMessage = ({ assignmentLevel, submission, totalScop
 
   const location = assignmentLevel === 'Council'
     ? `${submission.region || 'Unknown region'} - ${submission.council || 'Unknown council'}`
-    : (submission.region || 'Unknown region');
+    : assignmentLevel === 'Regional'
+      ? (submission.region || 'Unknown region')
+      : 'National';
 
   if (totalScopedJudges === 0) {
     return `No active ${assignmentLevel} judges found for ${location}`;
@@ -334,7 +336,7 @@ const isSubmissionEligibleForRoundChunkSchedule = async (submission, round) => {
 
 /**
  * Assign a judge to a submission using round-robin algorithm.
- * Only for Council and Regional levels.
+ * Council/Regional get one current assignment; National can have multiple judges.
  *
  * @param {Object} submission - Submission document
  * @param {Object} options - { roundId }
@@ -343,14 +345,6 @@ async function assignJudgeToSubmission(submission, options = {}) {
   try {
     if (!submission) {
       return { success: false, assignment: null, error: 'Submission is required' };
-    }
-
-    if (submission.level === 'National') {
-      return {
-        success: true,
-        assignment: null,
-        message: 'National level does not require assignment'
-      };
     }
 
     const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
@@ -387,21 +381,21 @@ async function assignJudgeToSubmission(submission, options = {}) {
       submission.roundId = roundId;
     }
 
-    const existingAssignment = await SubmissionAssignment.findOne({
+    const assignmentLevel = round.level || submission.level;
+    const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
+
+    const existingSubmissionAssignments = await SubmissionAssignment.find({
       roundId,
       submissionId: submission._id
-    });
+    }).select('judgeId');
 
-    if (existingAssignment) {
+    if (assignmentLevel !== 'National' && existingSubmissionAssignments.length > 0) {
       return {
         success: true,
-        assignment: existingAssignment,
+        assignment: existingSubmissionAssignments[0],
         message: 'Submission already assigned for this round'
       };
     }
-
-    const assignmentLevel = round.level || submission.level;
-    const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
 
     const areaQuery = buildJudgeAreaQueryByLevel(assignmentLevel, submission.region, assignmentCouncil);
     if (areaQuery === null) {
@@ -421,15 +415,21 @@ async function assignJudgeToSubmission(submission, options = {}) {
 
     const availableJudges = await User.find(judgeQuery).select('_id name email areasOfFocus');
     const submissionAreaOfFocus = submission.areaOfFocus || '';
+    const assignedJudgeIdsForSubmission = new Set(
+      existingSubmissionAssignments.map((assignment) => String(assignment.judgeId))
+    );
     const scopedAvailableJudges = availableJudges.filter((judge) =>
       judgeMatchesAreaOfFocus(judge, submissionAreaOfFocus)
+      && (assignmentLevel !== 'National' || !assignedJudgeIdsForSubmission.has(String(judge._id)))
     );
 
     if (scopedAvailableJudges.length === 0) {
       return {
         success: false,
         assignment: null,
-        error: `No active judges found for ${assignmentLevel} level at ${submission.region}${assignmentCouncil ? ` - ${assignmentCouncil}` : ''} with area of focus "${submissionAreaOfFocus || 'N/A'}"`
+        error: assignmentLevel === 'National'
+          ? `No unassigned active National judges match area of focus "${submissionAreaOfFocus || 'N/A'}"`
+          : `No active judges found for ${assignmentLevel} level at ${submission.region}${assignmentCouncil ? ` - ${assignmentCouncil}` : ''} with area of focus "${submissionAreaOfFocus || 'N/A'}"`
       };
     }
 
@@ -483,7 +483,8 @@ async function assignJudgeToSubmission(submission, options = {}) {
 
       const concurrentAssignment = await SubmissionAssignment.findOne({
         roundId,
-        submissionId: submission._id
+        submissionId: submission._id,
+        ...(assignmentLevel === 'National' ? { judgeId: selectedJudge._id } : {})
       });
 
       if (concurrentAssignment) {
@@ -559,28 +560,33 @@ async function getAssignedJudge(submissionId, roundId = null) {
     });
 
     let assignment = null;
+    let assignments = [];
     let resolvedRound = context.round || null;
 
     if (resolvedRound) {
-      assignment = await SubmissionAssignment.findOne({
+      assignments = await SubmissionAssignment.find({
         submissionId,
         roundId: resolvedRound._id
       })
+        .sort({ assignedAt: -1, createdAt: -1, _id: -1 })
         .populate('judgeId', 'name email username')
         .populate('roundId', 'year level status');
+      assignment = assignments[0] || null;
     }
 
     if (!assignment && includeHistorical) {
-      assignment = await SubmissionAssignment.findOne({ submissionId })
+      assignments = await SubmissionAssignment.find({ submissionId })
         .sort({ createdAt: -1 })
         .populate('judgeId', 'name email username')
         .populate('roundId', 'year level status');
+      assignment = assignments[0] || null;
       resolvedRound = assignment?.roundId || resolvedRound;
     }
 
     return {
       success: true,
       assignment,
+      assignments,
       round: resolvedRound,
       source: context.source,
       isHistorical: isRoundHistorical(resolvedRound),
@@ -689,7 +695,7 @@ async function resolveJudgeEvaluationAuthorization(submissionId, judgeId, roundI
  */
 async function assignUnassignedSubmissionsToJudge(judge) {
   try {
-    if (!judge || !judge.assignedLevel || judge.assignedLevel === 'National') {
+    if (!judge || !judge.assignedLevel) {
       return { success: true, assignedCount: 0, message: 'No round-scoped assignment required' };
     }
 
@@ -718,10 +724,15 @@ async function assignUnassignedSubmissionsToJudge(judge) {
       });
 
       for (const submission of submissions) {
-        const existing = await SubmissionAssignment.findOne({
+        const existingQuery = {
           roundId: round._id,
           submissionId: submission._id
-        }).select('_id');
+        };
+        if (judge.assignedLevel === 'National') {
+          existingQuery.judgeId = judge._id;
+        }
+
+        const existing = await SubmissionAssignment.findOne(existingQuery).select('_id');
 
         if (existing) continue;
 
@@ -758,10 +769,6 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
     const submission = await Submission.findById(submissionId);
     if (!submission) {
       return { success: false, assignment: null, error: 'Submission not found' };
-    }
-
-    if (submission.level === 'National') {
-      return { success: false, assignment: null, error: 'National level does not require assignment' };
     }
 
     const roundResolution = await resolveActionableRoundForSubmission(submission, options.roundId || null);
@@ -824,17 +831,24 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
 
     const assignmentQuery = {
       roundId: round._id,
-      submissionId
+      submissionId,
+      ...(assignmentLevel === 'National' ? { judgeId } : {})
     };
 
     let assignment = await SubmissionAssignment.findOne(assignmentQuery);
-    let message = 'Submission assigned successfully';
+    let message = assignmentLevel === 'National'
+      ? 'Judge added to national submission successfully'
+      : 'Submission assigned successfully';
 
     if (assignment) {
-      assignment.judgeId = judgeId;
-      assignment.judgeNotified = false;
-      await assignment.save();
-      message = 'Submission reassigned successfully';
+      if (assignmentLevel === 'National') {
+        message = 'Judge already assigned to this national submission';
+      } else {
+        assignment.judgeId = judgeId;
+        assignment.judgeNotified = false;
+        await assignment.save();
+        message = 'Submission reassigned successfully';
+      }
     } else {
       try {
         assignment = await SubmissionAssignment.create({
@@ -855,11 +869,14 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
         if (!assignment) {
           throw error;
         }
-
-        assignment.judgeId = judgeId;
-        assignment.judgeNotified = false;
-        await assignment.save();
-        message = 'Submission reassigned successfully';
+        if (assignmentLevel !== 'National') {
+          assignment.judgeId = judgeId;
+          assignment.judgeNotified = false;
+          await assignment.save();
+          message = 'Submission reassigned successfully';
+        } else {
+          message = 'Judge already assigned to this national submission';
+        }
       }
     }
 
@@ -915,14 +932,6 @@ async function getEligibleJudges(submissionId, options = {}) {
     const assignmentLevel = roundResolution.round.level || submission.level;
     const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
 
-    if (assignmentLevel === 'National') {
-      return {
-        success: true,
-        judges: [],
-        message: 'National level does not require assignment'
-      };
-    }
-
     const actionable = await ensureSubmissionActionableForAssignment(submission, roundResolution.round, {
       allowDisqualified: true
     });
@@ -954,19 +963,30 @@ async function getEligibleJudges(submissionId, options = {}) {
       .select('_id name email username assignedLevel assignedRegion assignedCouncil areasOfFocus')
       .sort({ name: 1 });
 
+    const existingAssignments = assignmentLevel === 'National'
+      ? await SubmissionAssignment.find({
+          roundId: roundResolution.round._id,
+          submissionId
+        }).select('judgeId')
+      : [];
+    const assignedJudgeIds = new Set(existingAssignments.map((assignment) => String(assignment.judgeId)));
+
     const eligibleJudges = judges.filter((judge) =>
       judgeMatchesAreaOfFocus(judge, submission.areaOfFocus || '')
+      && (assignmentLevel !== 'National' || !assignedJudgeIds.has(String(judge._id)))
     );
 
     return {
       success: true,
       judges: eligibleJudges,
-      message: buildEligibleJudgeEmptyMessage({
-        assignmentLevel,
-        submission,
-        totalScopedJudges: judges.length,
-        eligibleCount: eligibleJudges.length
-      }),
+      message: assignmentLevel === 'National' && eligibleJudges.length === 0 && assignedJudgeIds.size > 0
+        ? 'All matching National judges are already assigned to this submission'
+        : buildEligibleJudgeEmptyMessage({
+            assignmentLevel,
+            submission,
+            totalScopedJudges: judges.length,
+            eligibleCount: eligibleJudges.length
+          }),
       debug: process.env.NODE_ENV === 'development' ? {
         assignmentLevel,
         submissionRegion: submission.region || null,

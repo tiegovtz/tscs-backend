@@ -21,6 +21,15 @@ const router = express.Router();
 router.use(protect);
 router.use(authorize('admin', 'superadmin'));
 
+const isDuplicateKeyError = (error) => Boolean(error && (error.code === 11000 || error?.cause?.code === 11000));
+
+const getDuplicateUserMessage = (error) => {
+  const field = Object.keys(error?.keyPattern || error?.keyValue || {})[0];
+  if (field === 'username') return 'User with this username already exists';
+  if (field === 'email') return 'User with this email already exists';
+  return 'User with this username or email already exists';
+};
+
 const serializeAssignment = (assignment) => ({
   assignmentId: assignment._id,
   id: assignment._id,
@@ -474,13 +483,18 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Check if user already exists
-    const existingUser = await User.findOne({
-      isDeleted: { $ne: true },
+    const identityQuery = {
       $or: [
         { username: userData.username?.toLowerCase() },
         { email: userData.email?.toLowerCase() }
       ]
+    };
+
+    // Check if user already exists. Include deleted records separately because
+    // deployed databases may still have legacy username_1/email_1 indexes.
+    const existingUser = await User.findOne({
+      isDeleted: { $ne: true },
+      ...identityQuery
     });
 
     if (existingUser) {
@@ -490,7 +504,31 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const user = await User.create(userData);
+    const deletedUser = await User.findOne({
+      isDeleted: true,
+      ...identityQuery
+    });
+
+    let user;
+    let restoredDeletedUser = false;
+    if (deletedUser) {
+      if (req.user.role === 'admin' && !canAdminAccessUser(req.user, deletedUser)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Not authorized to recreate this user'
+        });
+      }
+
+      Object.assign(deletedUser, userData, {
+        isDeleted: false,
+        deletedAt: null,
+        deletedBy: null
+      });
+      user = await deletedUser.save();
+      restoredDeletedUser = true;
+    } else {
+      user = await User.create(userData);
+    }
 
     // If a judge was created, assign unassigned submissions to them (and other judges in the location)
     let assignmentResult = null;
@@ -518,6 +556,7 @@ router.post('/', async (req, res) => {
         targetUserRole: user.role,
         targetUserEmail: user.email,
         targetUserName: user.name,
+        restoredDeletedUser,
         ...(assignmentResult && { autoAssignedSubmissions: assignmentResult.assignedCount })
       },
       'success',
@@ -526,6 +565,7 @@ router.post('/', async (req, res) => {
 
     const response = {
       success: true,
+      message: restoredDeletedUser ? 'Deleted user restored and updated successfully' : 'User created successfully',
       user: user.toJSON()
     };
 
@@ -544,6 +584,12 @@ router.post('/', async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'An admin already exists for this level and area'
+      });
+    }
+    if (isDuplicateKeyError(error)) {
+      return res.status(400).json({
+        success: false,
+        message: getDuplicateUserMessage(error)
       });
     }
     res.status(500).json({

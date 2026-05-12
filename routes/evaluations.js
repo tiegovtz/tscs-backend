@@ -1,7 +1,6 @@
 const express = require('express');
 const Evaluation = require('../models/Evaluation');
 const Submission = require('../models/Submission');
-const SubmissionAssignment = require('../models/SubmissionAssignment');
 const { protect, authorize } = require('../middleware/auth');
 const { logger } = require('../utils/logger');
 const { resolveJudgeEvaluationAuthorization, isJudgeAssigned } = require('../utils/judgeAssignment');
@@ -235,20 +234,7 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       });
     }
 
-    if (submission.level === 'Council' || submission.level === 'Regional') {
-      const latestAssignment = await SubmissionAssignment.findOne({
-        submissionId: submission._id
-      })
-        .sort({ assignedAt: -1, createdAt: -1, _id: -1 })
-        .select('judgeId');
-
-      if (!latestAssignment || String(latestAssignment.judgeId) !== String(req.user._id)) {
-        return res.status(403).json({
-          success: false,
-          message: 'You are no longer assigned to evaluate this submission.'
-        });
-      }
-
+    if (['Council', 'Regional', 'National'].includes(submission.level)) {
       const authorization = await resolveJudgeEvaluationAuthorization(
         submissionId,
         req.user._id,
