@@ -15,7 +15,16 @@ const SubmissionAssignment = require('../models/SubmissionAssignment');
 const MONGO_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/tscs';
 
 async function dropIndexIfExists(collection, indexName) {
-  const indexes = await collection.indexes();
+  let indexes = [];
+  try {
+    indexes = await collection.indexes();
+  } catch (error) {
+    if (error.code === 26 || error.codeName === 'NamespaceNotFound') {
+      console.log(`- Collection not present, skipping: ${collection.collectionName}.${indexName}`);
+      return;
+    }
+    throw error;
+  }
   const exists = indexes.some((index) => index.name === indexName);
   if (!exists) {
     console.log(`- Index not present, skipping: ${collection.collectionName}.${indexName}`);
