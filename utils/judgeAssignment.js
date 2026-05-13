@@ -17,6 +17,8 @@ const { getCanonicalAreaOfFocusLabel } = require('./areaOfFocus');
 
 const ACTIONABLE_ASSIGNMENT_STATUSES = new Set(['pending', 'submitted', 'under_review', 'evaluated']);
 const LEGACY_SINGLE_ASSIGNMENT_INDEX = 'roundId_1_submissionId_1';
+const UNIQUE_JUDGE_ASSIGNMENT_INDEX = 'roundId_1_submissionId_1_judgeId_1';
+const UNIQUE_SCOPED_ASSIGNMENT_INDEX = 'roundId_1_submissionId_1_level_1';
 
 const isDuplicateKeyError = (error) => {
   return Boolean(error && (error.code === 11000 || error?.cause?.code === 11000));
@@ -34,21 +36,78 @@ const isLegacySingleAssignmentIndexError = (error) => {
     );
 };
 
+const getSubmissionAssignmentIndexes = async () => {
+  try {
+    return await SubmissionAssignment.collection.indexes();
+  } catch (error) {
+    if (error.code === 26 || error.codeName === 'NamespaceNotFound') {
+      return [];
+    }
+    throw error;
+  }
+};
+
+const dropIndexIfPresent = async (indexName) => {
+  try {
+    await SubmissionAssignment.collection.dropIndex(indexName);
+    return true;
+  } catch (error) {
+    if (
+      error.code === 26
+      || error.code === 27
+      || error.codeName === 'NamespaceNotFound'
+      || error.codeName === 'IndexNotFound'
+    ) {
+      return false;
+    }
+    throw error;
+  }
+};
+
+const ensureAssignmentIndex = async (key, options) => {
+  const indexName = options.name;
+  const indexes = await getSubmissionAssignmentIndexes();
+  const existing = indexes.find((index) => index.name === indexName);
+  const expectedPartial = options.partialFilterExpression
+    ? JSON.stringify(options.partialFilterExpression)
+    : null;
+  const existingPartial = existing?.partialFilterExpression
+    ? JSON.stringify(existing.partialFilterExpression)
+    : null;
+
+  if (
+    existing
+    && Boolean(existing.unique) === Boolean(options.unique)
+    && expectedPartial === existingPartial
+  ) {
+    return;
+  }
+
+  if (existing) {
+    await dropIndexIfPresent(indexName);
+  }
+
+  await SubmissionAssignment.collection.createIndex(key, options);
+};
+
 const dropLegacySingleAssignmentIndex = async () => {
   try {
-    await SubmissionAssignment.collection.dropIndex(LEGACY_SINGLE_ASSIGNMENT_INDEX);
-    await SubmissionAssignment.collection.createIndex(
+    const droppedLegacy = await dropIndexIfPresent(LEGACY_SINGLE_ASSIGNMENT_INDEX);
+    await ensureAssignmentIndex(
       { roundId: 1, submissionId: 1, judgeId: 1 },
-      { unique: true }
+      { name: UNIQUE_JUDGE_ASSIGNMENT_INDEX, unique: true }
     );
-    await SubmissionAssignment.collection.createIndex(
+    await ensureAssignmentIndex(
       { roundId: 1, submissionId: 1, level: 1 },
       {
+        name: UNIQUE_SCOPED_ASSIGNMENT_INDEX,
         unique: true,
         partialFilterExpression: { level: { $in: ['Council', 'Regional'] } }
       }
     );
-    console.warn(`Dropped legacy submission assignment index: ${LEGACY_SINGLE_ASSIGNMENT_INDEX}`);
+    if (droppedLegacy) {
+      console.warn(`Dropped legacy submission assignment index: ${LEGACY_SINGLE_ASSIGNMENT_INDEX}`);
+    }
     return true;
   } catch (error) {
     if (
