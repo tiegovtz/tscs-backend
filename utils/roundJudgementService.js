@@ -2435,6 +2435,7 @@ const canAdminAccessLeaderboard = (adminUser, leaderboard) => {
 
 const listAreaLeaderboards = async ({ filters = {}, user }) => {
   const query = {};
+  let stakeholderActiveNationalRound = null;
 
   if (filters.roundId) {
     const round = await CompetitionRound.findById(filters.roundId).select('year level');
@@ -2457,6 +2458,25 @@ const listAreaLeaderboards = async ({ filters = {}, user }) => {
 
   if (user.role === 'admin' || user.role === 'judge' || user.role === 'teacher' || user.role === 'stakeholder') {
     query.state = { $in: ['finalized', 'published'] };
+  }
+
+  if (user.role === 'stakeholder') {
+    stakeholderActiveNationalRound = await CompetitionRound.findOne({
+      status: 'active',
+      level: 'National'
+    })
+      .sort({ updatedAt: -1, createdAt: -1, _id: -1 })
+      .select('_id year level status');
+
+    if (stakeholderActiveNationalRound) {
+      query.year = stakeholderActiveNationalRound.year;
+      query.level = 'National';
+      query.areaType = 'national';
+      query.areaId = 'national';
+      query.state = {
+        $in: ['provisional', 'awaiting_superadmin_approval', 'finalized', 'published']
+      };
+    }
   }
 
   if (user.role === 'admin') {
@@ -2772,11 +2792,24 @@ const findAreaLeaderboardById = async ({ id, user }) => {
   if (!leaderboard) return null;
   leaderboard = await syncLeaderboardStatusesFromPromotionDecisions(leaderboard);
 
-  if (
-    ['judge', 'teacher', 'stakeholder', 'admin'].includes(user.role) &&
-    !['finalized', 'published'].includes(leaderboard.state)
-  ) {
+  if (['judge', 'teacher', 'admin'].includes(user.role) && !['finalized', 'published'].includes(leaderboard.state)) {
     return null;
+  }
+  if (user.role === 'stakeholder' && !['finalized', 'published'].includes(leaderboard.state)) {
+    const activeNationalRound = await CompetitionRound.findOne({
+      status: 'active',
+      level: 'National'
+    })
+      .sort({ updatedAt: -1, createdAt: -1, _id: -1 })
+      .select('_id year');
+    const isActiveNationalPreview =
+      Boolean(activeNationalRound)
+      && leaderboard.level === 'National'
+      && leaderboard.areaId === 'national'
+      && Number(leaderboard.year) === Number(activeNationalRound.year);
+    if (!isActiveNationalPreview) {
+      return null;
+    }
   }
   if (user.role === 'admin' && !canAdminAccessLeaderboard(user, leaderboard)) {
     return null;

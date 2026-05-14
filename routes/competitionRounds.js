@@ -1715,6 +1715,7 @@ router.get('/:id/judge-progress', async (req, res) => {
     const requestedRegion = normalize(req.query.region);
     const requestedCouncilRaw = normalize(req.query.council);
     const requestedGroupBy = normalize(req.query.groupBy).toLowerCase();
+    const requestedAreaIdRaw = normalize(req.query.areaId);
     const isCouncilRound = round.level === 'Council';
     const isNationalRound = round.level === 'National';
     const requestedCouncil = isCouncilRound ? requestedCouncilRaw : '';
@@ -1745,6 +1746,15 @@ router.get('/:id/judge-progress', async (req, res) => {
     const getAreaOfFocusLabel = (submission) => {
       const label = getCanonicalAreaOfFocusLabel(submission?.areaOfFocus || submission?.category || '');
       return label || 'Unknown';
+    };
+
+    const normalizedRequestedAreaId = isNationalRound
+      ? String(getCanonicalAreaOfFocusLabel(requestedAreaIdRaw) || requestedAreaIdRaw || '').trim().toLowerCase()
+      : requestedAreaIdRaw.toLowerCase();
+    const matchesRequestedArea = (areaKey) => {
+      if (!requestedAreaIdRaw) return true;
+      const normalizedAreaKey = String(areaKey || '').trim().toLowerCase();
+      return normalizedAreaKey === normalizedRequestedAreaId;
     };
 
     const buildAreaKey = (submission) => {
@@ -2123,6 +2133,91 @@ router.get('/:id/judge-progress', async (req, res) => {
       };
     }));
 
+    const judgeById = new Map(
+      judges.map((judge) => [String(judge._id), judge])
+    );
+
+    let selectedAreaDetails = null;
+    if (requestedAreaIdRaw) {
+      const areaSubmissions = allSubmissions.filter((submission) => {
+        const areaKey = buildAreaKey(submission);
+        return areaKey && matchesRequestedArea(areaKey);
+      });
+      const areaSubmissionIds = new Set(
+        areaSubmissions.map((submission) => String(submission._id))
+      );
+
+      const submissionRows = areaSubmissions
+        .map((submission) => {
+          const submissionId = String(submission._id);
+          const assignedJudgeIds = [
+            ...(assignedJudgeIdsBySubmission.get(submissionId) || new Set())
+          ];
+          const assignedJudges = assignedJudgeIds.map((judgeId) => {
+            const judge = judgeById.get(judgeId);
+            const completed = evaluatedSubmissionJudgePairSet.has(`${submissionId}::${judgeId}`);
+            return {
+              judgeId,
+              judgeName: judge?.name || judge?.username || judge?.email || 'Unknown',
+              completed
+            };
+          });
+          const completedAssignments = assignedJudges.filter((judgeRow) => judgeRow.completed).length;
+          return {
+            id: submissionId,
+            submissionId,
+            title: submission.title || submission.topic || submission.category || submission.subject || 'Untitled',
+            teacherName: submission.teacherName || submission.teacherId?.name || 'Unknown',
+            school: submission.school || 'Unknown',
+            status: submission.status || 'submitted',
+            submittedAt: submission.submittedAt || submission.updatedAt || submission.createdAt || null,
+            assignedEvaluations: assignedJudges.length,
+            completedEvaluations: completedAssignments,
+            assignedJudges
+          };
+        })
+        .sort((a, b) => new Date(b.submittedAt || 0) - new Date(a.submittedAt || 0));
+
+      const judgeRows = judgeProgress
+        .map((judgeRow) => {
+          const assignedInArea = (judgeRow.assignedSubmissionIds || []).filter((submissionId) =>
+            areaSubmissionIds.has(String(submissionId))
+          );
+          if (assignedInArea.length === 0) {
+            return null;
+          }
+          const pendingInArea = (judgeRow.pendingSubmissionIds || []).filter((submissionId) =>
+            areaSubmissionIds.has(String(submissionId))
+          );
+          const completedInArea = Math.max(assignedInArea.length - pendingInArea.length, 0);
+          return {
+            judgeId: judgeRow.judgeId,
+            judgeName: judgeRow.judgeName,
+            judgeEmail: judgeRow.judgeEmail,
+            totalAssigned: assignedInArea.length,
+            completed: completedInArea,
+            pending: pendingInArea.length,
+            percentage: assignedInArea.length > 0
+              ? Math.round((completedInArea / assignedInArea.length) * 100)
+              : 0
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.totalAssigned - a.totalAssigned || a.judgeName.localeCompare(b.judgeName));
+
+      const resolvedAreaLabel = areaSubmissions.length > 0
+        ? (buildAreaKey(areaSubmissions[0]) || requestedAreaIdRaw)
+        : requestedAreaIdRaw;
+
+      selectedAreaDetails = {
+        areaId: resolvedAreaLabel,
+        areaLabel: resolvedAreaLabel,
+        totalSubmissions: submissionRows.length,
+        submissions: submissionRows,
+        judges: judgeRows
+      };
+    }
+
     const totalSubmissions = allSubmissions.length;
     const totalJudges = judges.length;
     const totalEvaluations = isNationalRound
@@ -2198,6 +2293,7 @@ router.get('/:id/judge-progress', async (req, res) => {
       },
       judgeProgress,
       areaStats,
+      selectedAreaDetails,
       assignmentSummary: {
         totalSubmissions,
         assignedSubmissions: totalAssignedSubmissions,
