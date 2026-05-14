@@ -498,6 +498,150 @@ const getLatestEvaluationJudgeSetsBySubmission = async ({
   return map;
 };
 
+const resolveEvaluationScores = (evaluation = {}) => {
+  const numericAverage = Number(evaluation.averageScore);
+  const numericTotal = Number(evaluation.totalScore);
+  let scoresTotal = 0;
+  const scores = evaluation.scores;
+
+  if (scores instanceof Map) {
+    for (const value of scores.values()) {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) scoresTotal += numeric;
+    }
+  } else if (scores && typeof scores === 'object') {
+    for (const value of Object.values(scores)) {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) scoresTotal += numeric;
+    }
+  }
+
+  const resolvedAverage = Number.isFinite(numericAverage) && numericAverage > 0
+    ? numericAverage
+    : (Number.isFinite(numericTotal) && numericTotal > 0 ? numericTotal : scoresTotal);
+  const resolvedTotal = Number.isFinite(numericTotal) && numericTotal > 0
+    ? numericTotal
+    : (scoresTotal > 0 ? scoresTotal : (Number.isFinite(numericAverage) ? numericAverage : 0));
+
+  return {
+    averageScore: resolvedAverage,
+    totalScore: resolvedTotal
+  };
+};
+
+const getNationalPanelJudgeIdsBySubmission = async ({ roundId, submissionIds }) => {
+  const submissionObjectIds = toObjectIdList(submissionIds);
+  if (submissionObjectIds.length === 0) return new Map();
+
+  const assignments = await SubmissionAssignment.find({
+    roundId,
+    level: 'National',
+    submissionId: { $in: submissionObjectIds }
+  })
+    .select('submissionId judgeId assignedAt createdAt')
+    .sort({ assignedAt: 1, createdAt: 1, _id: 1 })
+    .lean();
+
+  const panelJudgeIdsBySubmission = new Map();
+  for (const assignment of assignments) {
+    const submissionId = String(assignment.submissionId);
+    const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+    if (!judgeId) continue;
+    if (!panelJudgeIdsBySubmission.has(submissionId)) {
+      panelJudgeIdsBySubmission.set(submissionId, []);
+    }
+    const panelJudgeIds = panelJudgeIdsBySubmission.get(submissionId);
+    if (panelJudgeIds.includes(judgeId)) continue;
+    if (panelJudgeIds.length >= NATIONAL_AREA_PANEL_SIZE) continue;
+    panelJudgeIds.push(judgeId);
+  }
+
+  return new Map(
+    [...panelJudgeIdsBySubmission.entries()].map(([submissionId, judgeIds]) => [
+      submissionId,
+      new Set(judgeIds)
+    ])
+  );
+};
+
+const getNationalPanelEvaluationMapForSubmissionIds = async ({
+  roundId,
+  submissionIds,
+  panelJudgeIdsBySubmission = null
+}) => {
+  const submissionObjectIds = toObjectIdList(submissionIds);
+  const submissionKeys = submissionObjectIds.map((submissionId) => String(submissionId));
+  const resolvedPanelJudgeIdsBySubmission = panelJudgeIdsBySubmission
+    || await getNationalPanelJudgeIdsBySubmission({ roundId, submissionIds: submissionObjectIds });
+
+  if (submissionObjectIds.length === 0) {
+    return {
+      evaluationMap: new Map(),
+      panelJudgeIdsBySubmission: resolvedPanelJudgeIdsBySubmission
+    };
+  }
+
+  const panelJudgeIds = [
+    ...new Set(
+      [...resolvedPanelJudgeIdsBySubmission.values()]
+        .flatMap((judgeSet) => [...judgeSet])
+    )
+  ];
+  const judgeObjectIds = toObjectIdList(panelJudgeIds);
+
+  const evaluations = judgeObjectIds.length > 0
+    ? await Evaluation.find({
+        roundId,
+        level: 'National',
+        submissionId: { $in: submissionObjectIds },
+        judgeId: { $in: judgeObjectIds }
+      })
+        .select('submissionId judgeId averageScore totalScore scores')
+        .lean()
+    : [];
+
+  const evaluationBySubmissionJudge = new Map();
+  for (const evaluation of evaluations) {
+    const submissionId = String(evaluation.submissionId);
+    const judgeId = String(evaluation.judgeId);
+    evaluationBySubmissionJudge.set(`${submissionId}::${judgeId}`, resolveEvaluationScores(evaluation));
+  }
+
+  const evaluationMap = new Map();
+  for (const submissionId of submissionKeys) {
+    const panelJudges = resolvedPanelJudgeIdsBySubmission.get(submissionId) || new Set();
+    const judgedIds = [];
+    let totalAverage = 0;
+    let totalScore = 0;
+
+    for (const judgeId of panelJudges) {
+      const scoreValue = evaluationBySubmissionJudge.get(`${submissionId}::${judgeId}`);
+      if (!scoreValue) continue;
+      judgedIds.push(judgeId);
+      totalAverage += Number(scoreValue.averageScore || 0);
+      totalScore += Number(scoreValue.totalScore || 0);
+    }
+
+    const totalEvaluations = judgedIds.length;
+    evaluationMap.set(submissionId, {
+      judgeIds: new Set(judgedIds),
+      roundIds: totalEvaluations > 0 ? new Set([String(roundId)]) : new Set(),
+      averageScore: totalEvaluations > 0
+        ? Math.round((totalAverage / totalEvaluations) * 100) / 100
+        : 0,
+      totalScore: totalEvaluations > 0
+        ? Math.round((totalScore / totalEvaluations) * 100) / 100
+        : 0,
+      totalEvaluations
+    });
+  }
+
+  return {
+    evaluationMap,
+    panelJudgeIdsBySubmission: resolvedPanelJudgeIdsBySubmission
+  };
+};
+
 const approximatelyEqual = (left, right, tolerance = 0.000001) => {
   return Math.abs(Number(left || 0) - Number(right || 0)) <= tolerance;
 };
@@ -888,7 +1032,9 @@ const assignRoundSubmissionsToJudges = async (round, submissions) => {
     );
     const existingAssignments = await SubmissionAssignment.find({
       roundId: round._id
-    }).select('submissionId judgeId');
+    })
+      .select('submissionId judgeId assignedAt createdAt')
+      .sort({ assignedAt: 1, createdAt: 1, _id: 1 });
     const externalSubmissionIds = [
       ...new Set(
         existingAssignments
@@ -939,9 +1085,7 @@ const assignRoundSubmissionsToJudges = async (round, submissions) => {
       ];
       const eligibleJudges = judges.filter((judge) => {
         const judgeAreas = Array.isArray(judge.areasOfFocus) ? judge.areasOfFocus : [];
-        return !areaKey
-          || judgeAreas.length === 0
-          || judgeAreas.some((focus) => matchesAreaOfFocus(focus, areaKey));
+        return judgeAreas.some((focus) => matchesAreaOfFocus(focus, areaKey));
       });
       const eligibleJudgeIds = new Set(eligibleJudges.map((judge) => String(judge._id)));
       const panelJudgeIds = existingPanelJudgeIds
@@ -1521,13 +1665,22 @@ const recalculateSubmissionAverageForRound = async (submissionId, roundId) => {
     return { averageScore: 0, totalEvaluations: 0 };
   }
   const submission = await Submission.findById(submissionId).select('disqualified status');
-  const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
-  const evaluationBySubmission = await getLatestEvaluationJudgeSetsBySubmission({
-    year: round.year,
-    level: round.level,
-    submissionIds: [submissionId],
-    roundIds
-  });
+  let evaluationBySubmission = new Map();
+  if (round.level === 'National') {
+    const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
+      roundId: round._id,
+      submissionIds: [submissionId]
+    });
+    evaluationBySubmission = panelResult.evaluationMap;
+  } else {
+    const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
+    evaluationBySubmission = await getLatestEvaluationJudgeSetsBySubmission({
+      year: round.year,
+      level: round.level,
+      submissionIds: [submissionId],
+      roundIds
+    });
+  }
   const scoreData = evaluationBySubmission.get(String(submissionId)) || {
     averageScore: 0,
     totalEvaluations: 0
@@ -1617,13 +1770,22 @@ const rebuildAreaLeaderboard = async (roundId, areaId, options = {}) => {
   const submissions = (await getAreaSubmissionsForLevel(round, areaId, { includeEvaluatedWithoutVideo: true }))
     .map((submission) => (submission && typeof submission.toObject === 'function' ? submission.toObject() : submission));
   const submissionIds = submissions.map((submission) => submission._id);
-  const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
-  const evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
-    year: round.year,
-    level: round.level,
-    submissionIds,
-    roundIds
-  });
+  let evaluationMap;
+  if (round.level === 'National') {
+    const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
+      roundId: round._id,
+      submissionIds
+    });
+    evaluationMap = panelResult.evaluationMap;
+  } else {
+    const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
+    evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
+      year: round.year,
+      level: round.level,
+      submissionIds,
+      roundIds
+    });
+  }
 
   const entries = submissions.map((submission) => {
     const scoreData = evaluationMap.get(String(submission._id)) || {
@@ -1739,13 +1901,24 @@ const checkAreaJudgeCompletion = async (roundId, areaId, options = {}) => {
       .filter((submission) => submission.disqualified === true || submission.status === 'disqualified')
       .map((submission) => String(submission._id))
   );
-  const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
-  const evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
-    year: round.year,
-    level: round.level,
-    submissionIds,
-    roundIds
-  });
+  let evaluationMap;
+  let nationalPanelJudgeIdsBySubmission = new Map();
+  if (round.level === 'National') {
+    const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
+      roundId: round._id,
+      submissionIds
+    });
+    evaluationMap = panelResult.evaluationMap;
+    nationalPanelJudgeIdsBySubmission = panelResult.panelJudgeIdsBySubmission;
+  } else {
+    const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
+    evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
+      year: round.year,
+      level: round.level,
+      submissionIds,
+      roundIds
+    });
+  }
 
   const blockers = [];
   let pendingCount = 0;
@@ -1781,23 +1954,29 @@ const checkAreaJudgeCompletion = async (roundId, areaId, options = {}) => {
     };
   }
 
-  const nationalJudges = await User.find({
-    role: 'judge',
-    status: 'active',
-    isDeleted: { $ne: true },
-    assignedLevel: round.level
-  }).select('_id');
-  const judgeIds = nationalJudges.map((judge) => String(judge._id));
+  const assignedJudgeIdsBySubmission = nationalPanelJudgeIdsBySubmission;
+  const areaJudgeIds = new Set();
+  for (const judgeIds of assignedJudgeIdsBySubmission.values()) {
+    for (const judgeId of judgeIds) {
+      areaJudgeIds.add(judgeId);
+    }
+  }
 
-  if (judgeIds.length === 0) {
+  if (areaJudgeIds.size === 0) {
     const activeSubmissionCount = submissionIds.length - disqualifiedSubmissionIds.size;
     return {
       ready: false,
       pendingCount: Math.max(activeSubmissionCount, 0),
       totalSubmissions: submissionIds.length,
       totalJudges: 0,
-      blockers: ['No active judges assigned for this level']
+      blockers: ['No assigned judges found for this national area yet']
     };
+  }
+
+  if (areaJudgeIds.size < NATIONAL_AREA_PANEL_SIZE) {
+    blockers.push(
+      `National area panel has ${areaJudgeIds.size} judge(s); ${NATIONAL_AREA_PANEL_SIZE} are required.`
+    );
   }
 
   for (const submissionId of submissionIds) {
@@ -1805,10 +1984,17 @@ const checkAreaJudgeCompletion = async (roundId, areaId, options = {}) => {
     if (disqualifiedSubmissionIds.has(submissionKey)) {
       continue;
     }
+    const requiredJudgeIds = assignedJudgeIdsBySubmission.get(submissionKey) || new Set();
+    if (requiredJudgeIds.size < NATIONAL_AREA_PANEL_SIZE) {
+      pendingCount += 1;
+      continue;
+    }
     const details = evaluationMap.get(submissionKey);
     const evaluatedJudgeIds = details?.judgeIds || new Set();
-    const allJudgesDone = judgeIds.every((judgeId) => evaluatedJudgeIds.has(judgeId));
-    if (!allJudgesDone) {
+    const hasAllRequiredEvaluations = [...requiredJudgeIds].every((judgeId) =>
+      evaluatedJudgeIds.has(judgeId)
+    );
+    if (!hasAllRequiredEvaluations) {
       pendingCount += 1;
     }
   }
@@ -1817,7 +2003,7 @@ const checkAreaJudgeCompletion = async (roundId, areaId, options = {}) => {
     ready: pendingCount === 0,
     pendingCount,
     totalSubmissions: submissionIds.length,
-    totalJudges: judgeIds.length,
+    totalJudges: areaJudgeIds.size,
     blockers
   };
 };
@@ -2731,6 +2917,170 @@ const addSubmissionToActiveRoundSnapshot = async (round, submission) => {
   };
 };
 
+const autoReassignUnassignedSubmissionsForRound = async (roundId, options = {}) => {
+  const round = await CompetitionRound.findById(roundId);
+  if (!round) {
+    return { success: false, status: 404, message: 'Competition round not found' };
+  }
+
+  const normalize = (value) => (value ? String(value).trim() : '');
+  const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const toExactRegex = (value) => {
+    const normalized = normalize(value);
+    return normalized ? new RegExp(`^${escapeRegExp(normalized)}$`, 'i') : null;
+  };
+
+  const isCouncilRound = round.level === 'Council';
+  const scopeRegionRegex = toExactRegex(options.region);
+  const scopeCouncilRegex = isCouncilRound ? toExactRegex(options.council) : null;
+  const normalizedAreaOfFocus = normalizeAreaOfFocus(options.areaOfFocus);
+
+  let snapshotSubmissionIds = Array.isArray(round.pendingSubmissionsSnapshot)
+    ? round.pendingSubmissionsSnapshot
+    : [];
+  let snapshotDoc = null;
+  if (snapshotSubmissionIds.length === 0) {
+    snapshotDoc = await RoundSnapshot.findOne({ roundId: round._id }).select('submissionIds');
+    snapshotSubmissionIds = snapshotDoc?.submissionIds || [];
+  }
+  const hasSnapshotContext = Boolean(
+    round.activationSnapshotId ||
+    snapshotDoc ||
+    snapshotSubmissionIds.length > 0
+  );
+  const roundScopedSubmissionExists = hasSnapshotContext
+    ? false
+    : Boolean(await Submission.exists({
+        roundId: round._id,
+        year: round.year,
+        level: round.level,
+        isDeleted: { $ne: true }
+      }));
+
+  const activeRoundSubmissionStatusExclusions = ['promoted', 'eliminated', 'disqualified'];
+  const submissionQuery = hasSnapshotContext
+    ? {
+        _id: { $in: snapshotSubmissionIds },
+        year: round.year,
+        level: round.level,
+        status: { $nin: activeRoundSubmissionStatusExclusions },
+        disqualified: { $ne: true },
+        isDeleted: { $ne: true }
+      }
+    : roundScopedSubmissionExists
+      ? {
+          roundId: round._id,
+          year: round.year,
+          level: round.level,
+          status: { $nin: activeRoundSubmissionStatusExclusions },
+          disqualified: { $ne: true },
+          isDeleted: { $ne: true }
+        }
+      : {
+          year: round.year,
+          level: round.level,
+          status: { $nin: activeRoundSubmissionStatusExclusions },
+          disqualified: { $ne: true },
+          isDeleted: { $ne: true }
+        };
+  if (scopeRegionRegex) submissionQuery.region = scopeRegionRegex;
+  if (isCouncilRound && scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
+
+  let scopedSubmissions = await Submission.find(submissionQuery).select(
+    '_id year level areaOfFocus region council status disqualified videoFileUrl videoLink preferredLink createdAt'
+  );
+  if (normalizedAreaOfFocus) {
+    scopedSubmissions = scopedSubmissions.filter((submission) =>
+      matchesAreaOfFocus(submission.areaOfFocus, normalizedAreaOfFocus)
+    );
+  }
+
+  if (scopedSubmissions.length === 0) {
+    return {
+      success: true,
+      roundId: String(round._id),
+      level: round.level,
+      scopedSubmissions: 0,
+      eligibleForAssignment: 0,
+      assigned: 0,
+      remainingUnassigned: 0
+    };
+  }
+
+  const scopedSubmissionIds = scopedSubmissions.map((submission) => submission._id);
+  const assignments = await SubmissionAssignment.find({
+    roundId: round._id,
+    level: round.level,
+    submissionId: { $in: scopedSubmissionIds }
+  }).select('submissionId judgeId');
+
+  const assignedJudgeIdsBySubmission = new Map();
+  for (const assignment of assignments) {
+    const submissionKey = String(assignment.submissionId);
+    if (!assignedJudgeIdsBySubmission.has(submissionKey)) {
+      assignedJudgeIdsBySubmission.set(submissionKey, new Set());
+    }
+    assignedJudgeIdsBySubmission.get(submissionKey).add(String(assignment.judgeId));
+  }
+
+  const submissionsNeedingAssignment = scopedSubmissions.filter((submission) => {
+    const submissionKey = String(submission._id);
+    const assignedJudges = assignedJudgeIdsBySubmission.get(submissionKey) || new Set();
+    if (round.level === 'National') {
+      return assignedJudges.size < NATIONAL_AREA_PANEL_SIZE;
+    }
+    return assignedJudges.size === 0;
+  });
+
+  if (submissionsNeedingAssignment.length === 0) {
+    return {
+      success: true,
+      roundId: String(round._id),
+      level: round.level,
+      scopedSubmissions: scopedSubmissions.length,
+      eligibleForAssignment: 0,
+      assigned: 0,
+      remainingUnassigned: 0
+    };
+  }
+
+  const assignmentResult = await assignRoundSubmissionsToJudges(round, submissionsNeedingAssignment);
+
+  const postAssignments = await SubmissionAssignment.find({
+    roundId: round._id,
+    level: round.level,
+    submissionId: { $in: submissionsNeedingAssignment.map((submission) => submission._id) }
+  }).select('submissionId judgeId');
+  const postAssignedJudgeIdsBySubmission = new Map();
+  for (const assignment of postAssignments) {
+    const submissionKey = String(assignment.submissionId);
+    if (!postAssignedJudgeIdsBySubmission.has(submissionKey)) {
+      postAssignedJudgeIdsBySubmission.set(submissionKey, new Set());
+    }
+    postAssignedJudgeIdsBySubmission.get(submissionKey).add(String(assignment.judgeId));
+  }
+
+  const remainingUnassigned = submissionsNeedingAssignment.filter((submission) => {
+    const submissionKey = String(submission._id);
+    const assignedJudges = postAssignedJudgeIdsBySubmission.get(submissionKey) || new Set();
+    if (round.level === 'National') {
+      return assignedJudges.size < NATIONAL_AREA_PANEL_SIZE;
+    }
+    return assignedJudges.size === 0;
+  }).length;
+
+  return {
+    success: true,
+    roundId: String(round._id),
+    level: round.level,
+    scopedSubmissions: scopedSubmissions.length,
+    eligibleForAssignment: submissionsNeedingAssignment.length,
+    assigned: assignmentResult.assigned || 0,
+    remainingUnassigned,
+    assignmentResult
+  };
+};
+
 /**
  * Discover areas that have eligible submissions but no AreaLeaderboard document
  * (or one with 0 entries). Used by the superadmin "Build Leaderboard" feature.
@@ -2846,5 +3196,6 @@ module.exports = {
   updateAreaStateByCompletion,
   checkAreaJudgeCompletion,
   addSubmissionToActiveRoundSnapshot,
-  discoverMissingLeaderboardAreas
+  discoverMissingLeaderboardAreas,
+  autoReassignUnassignedSubmissionsForRound
 };

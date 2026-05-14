@@ -158,19 +158,22 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
         .select('submissionId roundId assignedAt createdAt')
         .lean();
 
-      const assignmentPairs = assignmentsForJudge.map((assignment) => ({
-        _id: assignment.submissionId
-      }));
-      judgeAssignmentMap = new Map(
-        assignmentsForJudge.map((assignment) => [
-          String(assignment.submissionId),
-          {
-            roundId: assignment.roundId,
-            assignedAt: assignment.assignedAt,
-            createdAt: assignment.createdAt
-          }
-        ])
-      );
+      const assignmentPairs = [];
+      judgeAssignmentMap = new Map();
+      const seenSubmissionIds = new Set();
+      for (const assignment of assignmentsForJudge) {
+        const submissionId = String(assignment.submissionId);
+        if (seenSubmissionIds.has(submissionId)) {
+          continue;
+        }
+        seenSubmissionIds.add(submissionId);
+        assignmentPairs.push({ _id: assignment.submissionId });
+        judgeAssignmentMap.set(submissionId, {
+          roundId: assignment.roundId,
+          assignedAt: assignment.assignedAt,
+          createdAt: assignment.createdAt
+        });
+      }
       judgeAssignmentsCount = assignmentPairs.length;
 
       if (assignmentPairs.length > 0) {
@@ -185,17 +188,24 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
       query.$and = andClauses;
     }
 
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = parseInt(limit, 10) || 20;
-    const skip = (pageNum - 1) * limitNum;
+    const requestedPageNum = parseInt(page, 10) || 1;
+    const requestedLimitNum = parseInt(limit, 10) || 20;
 
     const total = await Submission.countDocuments(query);
-    const submissions = await Submission.find(query)
+    const shouldReturnAllForJudge = req.user.role === 'judge';
+    const pageNum = shouldReturnAllForJudge ? 1 : requestedPageNum;
+    const limitNum = shouldReturnAllForJudge
+      ? Math.max(total, 1)
+      : requestedLimitNum;
+    const skip = (pageNum - 1) * limitNum;
+
+    let submissionsQuery = Submission.find(query)
       .populate('teacherId', 'name email username')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum)
-      .lean();
+      .sort({ createdAt: -1 });
+    if (!shouldReturnAllForJudge) {
+      submissionsQuery = submissionsQuery.skip(skip).limit(limitNum);
+    }
+    const submissions = await submissionsQuery.lean();
 
     if (req.user.role === 'judge' && submissions.length > 0) {
       const submissionIds = submissions.map((submission) => submission._id);
@@ -221,8 +231,9 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
       count: submissions.length,
       total,
       page: pageNum,
-      pages: Math.ceil(total / limitNum),
+      pages: shouldReturnAllForJudge ? 1 : Math.ceil(total / limitNum),
       limit: limitNum,
+      allResults: shouldReturnAllForJudge,
       submissions
     };
 
@@ -1032,11 +1043,25 @@ router.get('/:id', async (req, res) => {
             message: 'Not authorized to access this submission'
           });
         }
-      } else if (submission.level === 'National' && req.user.assignedLevel !== 'National') {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to access this submission'
+      } else if (submission.level === 'National') {
+        if (req.user.assignedLevel !== 'National') {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this submission'
+          });
+        }
+
+        const hasNationalAssignment = await SubmissionAssignment.exists({
+          submissionId: submission._id,
+          judgeId: req.user._id,
+          level: 'National'
         });
+        if (!hasNationalAssignment) {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this submission'
+          });
+        }
       }
     }
 
