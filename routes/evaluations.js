@@ -223,10 +223,25 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       });
     }
 
-    if (round.status === 'closed' || round.status === 'archived') {
+    const existingEvaluation = await findExistingEvaluationForRound(
+      submission._id,
+      req.user._id,
+      round._id
+    );
+
+    const isRoundActive = round.status === 'active';
+
+    if (round.status === 'archived') {
       return res.status(403).json({
         success: false,
-        message: `Round is ${round.status}. Evaluations are not allowed.`
+        message: 'Round is archived. Evaluations are not allowed.'
+      });
+    }
+
+    if (!existingEvaluation && round.status === 'closed') {
+      return res.status(403).json({
+        success: false,
+        message: 'Round is closed. New evaluations are not allowed.'
       });
     }
 
@@ -266,6 +281,14 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       }
     }
 
+    // Judges can only edit previously submitted evaluations while the round is active.
+    if (existingEvaluation && !isRoundActive) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only edit an evaluation while the round is active.'
+      });
+    }
+
     const competition = await Competition.findOne({ year: submission.year });
     const rawCriteria = getEvaluationCriteriaFromCompetition(
       competition,
@@ -297,11 +320,6 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
 
     const totalScore = verdict.totalScore;
     const averageScore = verdict.averageScore;
-    const existingEvaluation = await findExistingEvaluationForRound(
-      submission._id,
-      req.user._id,
-      round._id
-    );
     const evaluationFilter = existingEvaluation
       ? { _id: existingEvaluation._id }
       : {
@@ -335,7 +353,7 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
     const areaId = getAreaIdFromSubmission(submission);
 
     await logger.logUserActivity(
-      'Judge submitted evaluation',
+      existingEvaluation ? 'Judge updated evaluation' : 'Judge submitted evaluation',
       req.user._id,
       req,
       {
@@ -347,10 +365,10 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
         totalScore,
         criteriaCount: Object.keys(scores).length
       },
-      'create'
+      existingEvaluation ? 'update' : 'create'
     );
 
-    res.status(201).json({
+    res.status(existingEvaluation ? 200 : 201).json({
       success: true,
       evaluation,
       round: {
