@@ -3235,11 +3235,3 @@ router.post('/:id/remind-location', async (req, res) => {
 });
 
 module.exports = router;
-    if (typeof updateData.stage !== 'undefined') {
-      if (!['standard', 'face_to_face'].includes(updateData.stage)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid stage value'
-        });
-      }
-    }
