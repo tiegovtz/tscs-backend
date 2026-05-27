@@ -856,4 +856,72 @@ router.delete('/:id/permanent', authorize('admin', 'superadmin'), async (req, re
   }
 });
 
+// @route   PATCH /api/users/:id/verify-email
+// @desc    Manually verify (activate) a user's email — skips email confirmation
+// @access  Private (Admin/Superadmin)
+router.patch('/:id/verify-email', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid user ID'
+      });
+    }
+
+    const user = await User.findOne({ _id: req.params.id, isDeleted: { $ne: true } });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Admin scope: only allow accessing users in their scope
+    if (req.user.role === 'admin' && !canAdminAccessUser(req.user, user)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to verify this user'
+      });
+    }
+
+    if (user.emailVerified) {
+      return res.status(400).json({
+        success: false,
+        message: 'User email is already verified'
+      });
+    }
+
+    user.emailVerified = true;
+    await user.save();
+
+    await logger.logAdminAction(
+      'Admin manually verified user email',
+      req.user._id,
+      req,
+      {
+        targetUserId: user._id.toString(),
+        targetUserRole: user.role,
+        targetUserEmail: user.email,
+        targetUserName: user.name
+      },
+      'success',
+      'update'
+    );
+
+    res.json({
+      success: true,
+      message: `Email for ${user.name} has been verified successfully`,
+      user: user.toJSON()
+    });
+  } catch (error) {
+    console.error('Verify email error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
 module.exports = router;
+
