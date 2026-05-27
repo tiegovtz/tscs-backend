@@ -10,6 +10,11 @@ const competitionRoundSchema = new mongoose.Schema({
     enum: ['Council', 'Regional', 'National'],
     required: true
   },
+  stage: {
+    type: String,
+    enum: ['standard', 'face_to_face'],
+    default: 'standard'
+  },
   status: {
     type: String,
     enum: ['draft', 'pending', 'active', 'ended', 'closed', 'archived'],
@@ -171,6 +176,7 @@ const competitionRoundSchema = new mongoose.Schema({
 
 // Indexes for efficient queries
 competitionRoundSchema.index({ year: 1, level: 1, status: 1 });
+competitionRoundSchema.index({ year: 1, level: 1, stage: 1, status: 1 });
 competitionRoundSchema.index({ year: 1, level: 1, region: 1, council: 1 });
 competitionRoundSchema.index({ endTime: 1, status: 1 });
 competitionRoundSchema.index({ status: 1 });

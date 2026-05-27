@@ -384,7 +384,11 @@ const buildLevelSubmissionQuery = (year, level) => {
 };
 
 const getRoundsForYearLevel = async (year, level) => {
-  return CompetitionRound.find({ year: Number(year), level })
+  return CompetitionRound.find({
+    year: Number(year),
+    level,
+    stage: { $ne: 'face_to_face' }
+  })
     .select('_id year level status createdAt updatedAt')
     .sort({ createdAt: 1, _id: 1 });
 };
@@ -1729,10 +1733,13 @@ const ensureAssignedSubmissionInRoundSnapshot = async (submission, round) => {
   return true;
 };
 
-const getRoundBySubmissionForEvaluation = async (submission) => {
+const getRoundBySubmissionForEvaluation = async (submission, options = {}) => {
+  const { explicitRoundId = null } = options;
   const context = await resolveSubmissionRoundContext(submission, {
+    explicitRoundId,
     includeHistorical: false,
-    allowFallbackByYearLevel: true
+    allowFallbackByYearLevel: true,
+    includeFaceToFace: Boolean(explicitRoundId)
   });
   const round = context.round;
 

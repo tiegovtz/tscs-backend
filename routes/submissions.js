@@ -225,20 +225,57 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
 
     if (req.user.role === 'judge' && submissions.length > 0) {
       const submissionIds = submissions.map((submission) => submission._id);
+      const assignedRoundIds = [
+        ...new Set(
+          [...judgeAssignmentMap.values()]
+            .map((meta) => (meta?.roundId ? String(meta.roundId) : null))
+            .filter(Boolean)
+        )
+      ];
+      const roundStageById = new Map();
+      if (assignedRoundIds.length > 0) {
+        const rounds = await CompetitionRound.find({
+          _id: { $in: assignedRoundIds }
+        }).select('_id stage').lean();
+        for (const round of rounds) {
+          roundStageById.set(String(round._id), round.stage || 'standard');
+        }
+      }
+
       const evaluationDocs = await Evaluation.find({
         submissionId: { $in: submissionIds },
-        judgeId: req.user._id
-      }).select('submissionId').lean();
+        judgeId: req.user._id,
+        ...(assignedRoundIds.length > 0
+          ? { roundId: { $in: assignedRoundIds } }
+          : {})
+      }).select('submissionId roundId').lean();
 
-      const evaluatedSubmissionIds = new Set(evaluationDocs.map((evaluation) => String(evaluation.submissionId)));
+      const evaluatedSubmissionIds = new Set();
+      const evaluatedPairs = new Set();
+      for (const evaluation of evaluationDocs) {
+        const submissionId = String(evaluation.submissionId);
+        evaluatedSubmissionIds.add(submissionId);
+        if (evaluation.roundId) {
+          evaluatedPairs.add(`${submissionId}::${String(evaluation.roundId)}`);
+        }
+      }
+
 
       for (const submission of submissions) {
         const submissionId = String(submission._id);
         const assignedMeta = judgeAssignmentMap.get(submissionId) || null;
-        const judgeCompleted = evaluatedSubmissionIds.has(submissionId);
+        const assignedRoundId = assignedMeta?.roundId
+          ? String(assignedMeta.roundId)
+          : (submission.roundId ? String(submission.roundId) : null);
+        const judgeCompleted = assignedRoundId
+          ? evaluatedPairs.has(`${submissionId}::${assignedRoundId}`)
+          : evaluatedSubmissionIds.has(submissionId);
         submission.judgeCompleted = judgeCompleted;
         submission.judgeCompletionStatus = judgeCompleted ? 'completed' : 'pending';
-        submission.assignedRoundId = assignedMeta?.roundId || submission.roundId || null;
+        submission.assignedRoundId = assignedRoundId;
+        submission.assignedRoundStage = assignedRoundId
+          ? (roundStageById.get(assignedRoundId) || null)
+          : null;
       }
     }
 
@@ -1895,6 +1932,7 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
       assignedAt: item.assignedAt,
       roundId: item.roundId?._id || item.roundId || null,
       roundStatus: item.roundId?.status || resolvedRound?.status || null,
+      roundStage: item.roundId?.stage || resolvedRound?.stage || 'standard',
       isHistorical: assignmentResult.isHistorical === true
     });
     
@@ -1905,6 +1943,7 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
       roundContext: resolvedRound ? {
         roundId: resolvedRound._id || resolvedRound,
         roundStatus: resolvedRound.status || null,
+        roundStage: resolvedRound.stage || 'standard',
         isActionable: isRoundActionable(resolvedRound)
       } : null,
       message: assignment
@@ -1971,7 +2010,8 @@ router.post(
       const roundResolution = await resolveSubmissionRoundContext(submission, {
         explicitRoundId: req.body.roundId || req.query.roundId || null,
         includeHistorical: false,
-        allowFallbackByYearLevel: true
+        allowFallbackByYearLevel: true,
+        includeFaceToFace: Boolean(req.body.roundId || req.query.roundId)
       });
 
       if (!roundResolution.round) {
@@ -2014,7 +2054,8 @@ router.post(
           judgeId: result.assignment.judgeId,
           assignedAt: result.assignment.assignedAt,
           roundId: result.assignment.roundId,
-          roundStatus: roundResolution.round.status
+          roundStatus: roundResolution.round.status,
+          roundStage: roundResolution.round.stage || 'standard'
         },
         message: result.message
       });

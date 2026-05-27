@@ -51,21 +51,38 @@ const getRoundStatusFilter = ({ includeHistorical = false } = {}) => {
     : [...ACTIONABLE_ROUND_STATUSES];
 };
 
-const findRoundsByLevel = async ({ level, year = null, includeHistorical = false }) => {
+const findRoundsByLevel = async ({
+  level,
+  year = null,
+  includeHistorical = false,
+  includeFaceToFace = false
+}) => {
   if (!level) return [];
   const query = {
     level,
     status: { $in: getRoundStatusFilter({ includeHistorical }) }
   };
+  if (!includeFaceToFace) {
+    query.stage = { $ne: 'face_to_face' };
+  }
   if (year !== null && year !== undefined && Number.isFinite(Number(year))) {
     query.year = Number(year);
   }
-  const rounds = await CompetitionRound.find(query).select('_id year level status createdAt endTime');
+  const rounds = await CompetitionRound.find(query).select('_id year level stage status createdAt endTime');
   return sortRoundsByPriority(rounds);
 };
 
-const getActionableRoundIdsForLevel = async ({ level, year = null }) => {
-  const rounds = await findRoundsByLevel({ level, year, includeHistorical: false });
+const getActionableRoundIdsForLevel = async ({
+  level,
+  year = null,
+  includeFaceToFace = false
+}) => {
+  const rounds = await findRoundsByLevel({
+    level,
+    year,
+    includeHistorical: false,
+    includeFaceToFace
+  });
   return rounds.map((round) => round._id);
 };
 
@@ -73,7 +90,8 @@ const resolveSubmissionRoundContext = async (submission, options = {}) => {
   const {
     explicitRoundId = null,
     includeHistorical = false,
-    allowFallbackByYearLevel = true
+    allowFallbackByYearLevel = true,
+    includeFaceToFace = false
   } = options;
 
   const allowedStatuses = getRoundStatusFilter({ includeHistorical });
@@ -88,12 +106,41 @@ const resolveSubmissionRoundContext = async (submission, options = {}) => {
       };
     }
 
+    if (!includeFaceToFace && explicitRound.stage === 'face_to_face') {
+      if (allowFallbackByYearLevel) {
+        const fallbackRounds = await findRoundsByLevel({
+          level: submission?.level || explicitRound.level,
+          year: submission?.year || explicitRound.year,
+          includeHistorical,
+          includeFaceToFace
+        });
+        const fallbackRound = fallbackRounds[0] || null;
+        if (fallbackRound) {
+          return {
+            round: fallbackRound,
+            source: 'fallback',
+            reason: null,
+            rejectedRound: explicitRound,
+            rejectedReason: 'explicit_round_stage_not_allowed'
+          };
+        }
+      }
+
+      return {
+        round: null,
+        source: 'explicit',
+        reason: 'explicit_round_stage_not_allowed',
+        rejectedRound: explicitRound
+      };
+    }
+
     if (submission && !roundMatchesSubmission(explicitRound, submission)) {
       if (allowFallbackByYearLevel) {
         const fallbackRounds = await findRoundsByLevel({
           level: submission.level,
           year: submission.year,
-          includeHistorical
+          includeHistorical,
+          includeFaceToFace
         });
         const fallbackRound = fallbackRounds[0] || null;
         if (fallbackRound) {
@@ -134,11 +181,27 @@ const resolveSubmissionRoundContext = async (submission, options = {}) => {
   if (submission?.roundId) {
     const submissionRound = await CompetitionRound.findById(submission.roundId);
     if (submissionRound && roundMatchesSubmission(submissionRound, submission)) {
-      if (allowedStatuses.includes(submissionRound.status)) {
+      if (!includeFaceToFace && submissionRound.stage === 'face_to_face') {
+        if (!allowFallbackByYearLevel) {
+          return {
+            round: null,
+            source: 'submission',
+            reason: 'submission_round_stage_not_allowed',
+            rejectedRound: submissionRound
+          };
+        }
+      } else if (allowedStatuses.includes(submissionRound.status)) {
         return {
           round: submissionRound,
           source: 'submission',
           reason: null
+        };
+      } else if (!allowFallbackByYearLevel) {
+        return {
+          round: null,
+          source: 'submission',
+          reason: 'submission_round_not_allowed',
+          rejectedRound: submissionRound
         };
       }
 
@@ -157,7 +220,8 @@ const resolveSubmissionRoundContext = async (submission, options = {}) => {
     const fallbackRounds = await findRoundsByLevel({
       level: submission.level,
       year: submission.year,
-      includeHistorical
+      includeHistorical,
+      includeFaceToFace
     });
     const fallbackRound = fallbackRounds[0] || null;
     if (fallbackRound) {

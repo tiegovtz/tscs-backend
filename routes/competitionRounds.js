@@ -230,6 +230,8 @@ router.use(protect);
 router.get('/active', cacheMiddleware(60), async (req, res) => {
   try {
     const user = req.user;
+    const includeFaceToFace = String(req.query.includeFaceToFace || '').toLowerCase() === 'true';
+    const stageFilter = includeFaceToFace ? {} : { stage: { $ne: 'face_to_face' } };
 
     if (!user) {
       return res.json({
@@ -246,14 +248,18 @@ router.get('/active', cacheMiddleware(60), async (req, res) => {
       // or latest ended round as fallback while finishing pending tasks.
       const levelRounds = await CompetitionRound.find({
         level: user.assignedLevel,
-        status: { $in: ['active', 'ended'] }
+        status: { $in: ['active', 'ended'] },
+        ...stageFilter
       }).sort({ createdAt: -1 });
 
       const activeRound = levelRounds.find((round) => round.status === 'active') || null;
       const endedRound = levelRounds.find((round) => round.status === 'ended') || null;
       rounds = activeRound ? [activeRound] : endedRound ? [endedRound] : [];
     } else if (user.role === 'stakeholder') {
-      const latestActiveRound = await CompetitionRound.findOne({ status: 'active' })
+      const latestActiveRound = await CompetitionRound.findOne({
+        status: 'active',
+        ...stageFilter
+      })
         .sort({ updatedAt: -1, createdAt: -1 });
       rounds = latestActiveRound ? [latestActiveRound] : [];
     }
@@ -292,12 +298,17 @@ router.use((req, res, next) => {
 // @access  Private (Superadmin)
 router.get('/', async (req, res) => {
   try {
-    const { year, level, status } = req.query;
+    const { year, level, status, stage, includeFaceToFace } = req.query;
     
     let query = {};
     if (year) query.year = parseInt(year);
     if (level) query.level = level;
     if (status) query.status = status;
+    if (stage) {
+      query.stage = stage;
+    } else if (String(includeFaceToFace || '').toLowerCase() !== 'true') {
+      query.stage = { $ne: 'face_to_face' };
+    }
 
     const rounds = await CompetitionRound.find(query)
       .populate('closedBy', 'name email')
@@ -606,6 +617,7 @@ router.post('/', async (req, res) => {
     const {
       year,
       level,
+      stage,
       timingType,
       endTime,
       startTime,
@@ -651,9 +663,11 @@ router.post('/', async (req, res) => {
     }
 
     // National single timeline: only one draft/pending/active round per year + level.
+    const normalizedStage = stage === 'face_to_face' ? 'face_to_face' : 'standard';
     const existingQuery = {
       year: parseInt(year),
       level,
+      stage: normalizedStage,
       status: { $in: ['draft', 'pending', 'active'] }
     };
 
@@ -681,6 +695,7 @@ router.post('/', async (req, res) => {
     const roundData = {
       year: parseInt(year),
       level,
+      stage: normalizedStage,
       timingType,
       endTime: actualEndTime,
       startTime: startTime ? new Date(startTime) : null,
@@ -787,6 +802,16 @@ router.put('/:id', async (req, res) => {
     }
     if (typeof updateData.council !== 'undefined') {
       updateData.council = null;
+    }
+
+    if (typeof updateData.stage !== 'undefined') {
+      if (!['standard', 'face_to_face'].includes(String(updateData.stage))) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid stage value'
+        });
+      }
+      updateData.stage = String(updateData.stage);
     }
     
     // Recalculate end time if timing changed
@@ -3210,3 +3235,11 @@ router.post('/:id/remind-location', async (req, res) => {
 });
 
 module.exports = router;
+    if (typeof updateData.stage !== 'undefined') {
+      if (!['standard', 'face_to_face'].includes(updateData.stage)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid stage value'
+        });
+      }
+    }

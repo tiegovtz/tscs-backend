@@ -37,8 +37,8 @@ router.use((req, res, next) => {
  * Resolve which round an evaluation should be written to.
  * Evaluations are only allowed when the submission is in an actionable round snapshot.
  */
-async function resolveEvaluationRoundForJudge(submission) {
-  const snapshotRound = await getRoundBySubmissionForEvaluation(submission);
+async function resolveEvaluationRoundForJudge(submission, options = {}) {
+  const snapshotRound = await getRoundBySubmissionForEvaluation(submission, options);
   if (snapshotRound) {
     return {
       round: snapshotRound,
@@ -96,7 +96,7 @@ router.get('/', cacheMiddleware(15), async (req, res) => {
     const evaluations = await Evaluation.find(query)
       .populate('submissionId', 'teacherName category subject level region council')
       .populate('judgeId', 'name username')
-      .populate('roundId', 'year level status')
+      .populate('roundId', 'year level status stage')
       .sort({ submittedAt: -1 });
 
     await logger.logUserActivity(
@@ -133,7 +133,7 @@ router.get('/:id', async (req, res) => {
     const evaluation = await Evaluation.findById(req.params.id)
       .populate('submissionId')
       .populate('judgeId', 'name username')
-      .populate('roundId', 'year level status');
+      .populate('roundId', 'year level status stage');
 
     if (!evaluation) {
       return res.status(404).json({
@@ -198,7 +198,7 @@ router.get('/:id', async (req, res) => {
 // @access  Private (Judge)
 router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leaderboard*', 'cache:/api/submissions*']), async (req, res) => {
   try {
-    const { submissionId, scores, comments } = req.body;
+    const { submissionId, scores, comments, roundId: explicitRoundId } = req.body;
 
     if (!submissionId || !scores || typeof scores !== 'object') {
       return res.status(400).json({
@@ -215,7 +215,9 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       });
     }
 
-    const { round } = await resolveEvaluationRoundForJudge(submission);
+    const { round } = await resolveEvaluationRoundForJudge(submission, {
+      explicitRoundId: explicitRoundId || req.query?.roundId || null
+    });
     if (!round) {
       return res.status(403).json({
         success: false,
@@ -345,10 +347,13 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       { new: true, upsert: !existingEvaluation, runValidators: true }
     )
       .populate('submissionId', 'teacherName category subject level region council')
-      .populate('roundId', 'year level status');
+      .populate('roundId', 'year level status stage');
 
-    await refreshSubmissionAndAreaLeaderboard({ submissionId, roundId: round._id });
-    await markRoundEndedIfComplete(round._id);
+    const isFaceToFaceRound = String(round.stage || 'standard') === 'face_to_face';
+    if (!isFaceToFaceRound) {
+      await refreshSubmissionAndAreaLeaderboard({ submissionId, roundId: round._id });
+      await markRoundEndedIfComplete(round._id);
+    }
 
     const areaId = getAreaIdFromSubmission(submission);
 
@@ -375,6 +380,7 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
         id: round._id,
         year: round.year,
         level: round.level,
+        stage: round.stage || 'standard',
         status: round.status
       }
     });
@@ -414,7 +420,7 @@ router.get('/submission/:submissionId', async (req, res) => {
 
     const evaluations = await Evaluation.find(query)
       .populate('judgeId', 'name username assignedLevel')
-      .populate('roundId', 'year level status')
+      .populate('roundId', 'year level status stage')
       .sort({ submittedAt: -1 });
 
     await logger.logUserActivity(
@@ -472,7 +478,9 @@ router.post('/:submissionId/disqualify', authorize('judge'), async (req, res) =>
       });
     }
 
-    const { round } = await resolveEvaluationRoundForJudge(submission);
+    const { round } = await resolveEvaluationRoundForJudge(submission, {
+      explicitRoundId: req.body?.roundId || req.query?.roundId || null
+    });
     if (!round) {
       return res.status(400).json({
         success: false,

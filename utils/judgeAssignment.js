@@ -188,6 +188,11 @@ const judgeMatchesAreaOfFocus = (judge, submissionAreaOfFocus) => {
   );
 };
 
+const isFaceToFaceNationalRound = (round) => (
+  String(round?.level || '') === 'National'
+  && String(round?.stage || '') === 'face_to_face'
+);
+
 const buildEligibleJudgeEmptyMessage = ({ assignmentLevel, submission, totalScopedJudges, eligibleCount }) => {
   if (eligibleCount > 0) {
     return `${eligibleCount} eligible judge(s) found`;
@@ -454,7 +459,8 @@ const resolveActionableRoundForSubmission = async (submission, explicitRoundId =
   const context = await resolveSubmissionRoundContext(submission, {
     explicitRoundId,
     includeHistorical: false,
-    allowFallbackByYearLevel: true
+    allowFallbackByYearLevel: true,
+    includeFaceToFace: Boolean(explicitRoundId)
   });
 
   if (!context.round) {
@@ -738,7 +744,8 @@ async function getAssignedJudge(submissionId, roundId = null) {
     const context = await resolveSubmissionRoundContext(submission, {
       explicitRoundId: options.roundId || null,
       includeHistorical,
-      allowFallbackByYearLevel: true
+      allowFallbackByYearLevel: true,
+      includeFaceToFace: Boolean(options.roundId)
     });
 
     let assignment = null;
@@ -752,7 +759,7 @@ async function getAssignedJudge(submissionId, roundId = null) {
       })
         .sort({ assignedAt: -1, createdAt: -1, _id: -1 })
         .populate('judgeId', 'name email username')
-        .populate('roundId', 'year level status');
+        .populate('roundId', 'year level status stage');
       assignment = assignments[0] || null;
     }
 
@@ -760,7 +767,7 @@ async function getAssignedJudge(submissionId, roundId = null) {
       assignments = await SubmissionAssignment.find({ submissionId })
         .sort({ createdAt: -1 })
         .populate('judgeId', 'name email username')
-        .populate('roundId', 'year level status');
+        .populate('roundId', 'year level status stage');
       assignment = assignments[0] || null;
       resolvedRound = assignment?.roundId || resolvedRound;
     }
@@ -883,7 +890,8 @@ async function assignUnassignedSubmissionsToJudge(judge) {
 
     const rounds = await CompetitionRound.find({
       level: judge.assignedLevel,
-      status: 'active'
+      status: 'active',
+      stage: { $ne: 'face_to_face' }
     }).select('_id year level pendingSubmissionsSnapshot');
 
     if (rounds.length === 0) {
@@ -971,6 +979,7 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
     }
 
     const assignmentLevel = round.level || submission.level;
+    const isFaceToFaceRound = isFaceToFaceNationalRound(round);
     const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
     const chunkEligible = await isSubmissionEligibleForRoundChunkSchedule(submission, round);
     if (!chunkEligible) {
@@ -1011,7 +1020,7 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
 
     await ensureSubmissionInRoundSnapshot(submission, round);
 
-    if (assignmentLevel === 'National') {
+    if (assignmentLevel === 'National' && !isFaceToFaceRound) {
       const areaSubmissions = await getNationalAreaSubmissionsForAssignment(round, submission);
       const areaSubmissionIds = areaSubmissions.map((areaSubmission) => areaSubmission._id);
       const existingAreaAssignments = areaSubmissionIds.length > 0
@@ -1110,6 +1119,71 @@ async function manuallyAssignSubmission(submissionId, judgeId, options = {}) {
       };
     }
 
+    if (assignmentLevel === 'National' && isFaceToFaceRound) {
+      const assignmentQuery = {
+        roundId: round._id,
+        submissionId,
+        judgeId
+      };
+
+      let assignment = await SubmissionAssignment.findOne(assignmentQuery);
+      const hadExistingAssignment = Boolean(assignment);
+      let message = 'Judge assigned to submission for face-to-face evaluation';
+
+      if (!assignment) {
+        try {
+          assignment = await createSubmissionAssignment({
+            roundId: round._id,
+            submissionId,
+            judgeId,
+            level: assignmentLevel,
+            region: submission.region || null,
+            council: null,
+            judgeNotified: false
+          });
+        } catch (error) {
+          if (!isDuplicateKeyError(error)) {
+            throw error;
+          }
+          assignment = await SubmissionAssignment.findOne(assignmentQuery);
+          if (!assignment) {
+            throw error;
+          }
+          message = 'Judge already assigned to this face-to-face submission';
+        }
+      } else {
+        message = 'Judge already assigned to this face-to-face submission';
+      }
+
+      if (!hadExistingAssignment && message !== 'Judge already assigned to this face-to-face submission') {
+        notificationService.handleJudgeAssigned({
+          userId: judgeId.toString(),
+          submissionId: submissionId.toString(),
+          teacherName: submission.teacherName,
+          subject: submission.subject,
+          areaOfFocus: submission.areaOfFocus,
+          level: assignmentLevel,
+          region: submission.region,
+          council: null
+        }).catch((error) => {
+          console.error('Error sending judge assignment notification:', error);
+        });
+      }
+
+      if (!hadExistingAssignment && !assignment.judgeNotified) {
+        assignment.judgeNotified = true;
+        await assignment.save();
+      }
+
+      return {
+        success: true,
+        assignment,
+        assignments: [assignment],
+        message,
+        roundId: round._id.toString()
+      };
+    }
+
     const assignmentQuery = {
       roundId: round._id,
       submissionId
@@ -1200,6 +1274,7 @@ async function getEligibleJudges(submissionId, options = {}) {
     }
 
     const assignmentLevel = roundResolution.round.level || submission.level;
+    const isFaceToFaceRound = isFaceToFaceNationalRound(roundResolution.round);
     const assignmentCouncil = assignmentLevel === 'Council' ? submission.council : null;
 
     const actionable = await ensureSubmissionActionableForAssignment(submission, roundResolution.round, {
@@ -1241,7 +1316,7 @@ async function getEligibleJudges(submissionId, options = {}) {
       : [];
     const assignedJudgeIds = new Set(existingAssignments.map((assignment) => String(assignment.judgeId)));
     let nationalAreaPanelJudgeIds = null;
-    if (assignmentLevel === 'National') {
+    if (assignmentLevel === 'National' && !isFaceToFaceRound) {
       const areaSubmissions = await getNationalAreaSubmissionsForAssignment(roundResolution.round, submission);
       const areaSubmissionIds = areaSubmissions.map((areaSubmission) => areaSubmission._id);
       const areaAssignments = areaSubmissionIds.length > 0
@@ -1258,6 +1333,7 @@ async function getEligibleJudges(submissionId, options = {}) {
       && (assignmentLevel !== 'National' || !assignedJudgeIds.has(String(judge._id)))
       && (
         assignmentLevel !== 'National'
+        || isFaceToFaceRound
         || nationalAreaPanelJudgeIds.size < 3
         || nationalAreaPanelJudgeIds.has(String(judge._id))
       )
@@ -1266,7 +1342,9 @@ async function getEligibleJudges(submissionId, options = {}) {
     return {
       success: true,
       judges: eligibleJudges,
-      message: assignmentLevel === 'National' && eligibleJudges.length === 0 && assignedJudgeIds.size > 0
+      message: assignmentLevel === 'National' && isFaceToFaceRound && eligibleJudges.length === 0
+        ? 'All matching National judges are already assigned to this face-to-face submission'
+        : assignmentLevel === 'National' && eligibleJudges.length === 0 && assignedJudgeIds.size > 0
         ? 'All National area panel judges are already assigned to this submission'
         : assignmentLevel === 'National' && eligibleJudges.length === 0 && nationalAreaPanelJudgeIds?.size >= 3
           ? 'This National area of competition already has 3 assigned judges'
