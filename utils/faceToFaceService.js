@@ -8,9 +8,20 @@ const FaceToFaceSelection = require('../models/FaceToFaceSelection');
 const FACE_TO_FACE_ROUND_STAGE = 'face_to_face';
 const FACE_TO_FACE_WEIGHT_NATIONAL = 0.4;
 const FACE_TO_FACE_WEIGHT_PANEL = 0.6;
-const NATIONAL_DEFAULT_SELECTION_COUNT = 5;
+const FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA = 1;
 
 const roundToTwo = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+
+const normalizeAreaOfFocusKey = (value) => String(value || 'Unknown')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '_')
+  .replace(/^_+|_+$/g, '') || 'unknown';
+
+const getAreaOfFocusLabel = (value) => {
+  const label = String(value || '').trim();
+  return label || 'Unknown';
+};
 
 const toObjectIdList = (values = []) => (
   [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))]
@@ -88,19 +99,31 @@ const ensureFaceToFaceRound = async (year) => {
   return round;
 };
 
-const getDefaultTopFiveSubmissions = async (year) => {
+const getDefaultAreaScopedSubmissions = async (year) => {
   const resolvedYear = resolveDashboardYear(year);
-  return Submission.find({
+  const submissions = await Submission.find({
     year: resolvedYear,
     level: 'National',
-    status: 'promoted',
     isDeleted: { $ne: true },
     disqualified: { $ne: true }
   })
-    .select('_id')
+    .select('_id areaOfFocus')
     .sort({ averageScore: -1, createdAt: 1, _id: 1 })
-    .limit(NATIONAL_DEFAULT_SELECTION_COUNT)
     .lean();
+
+  const areaSelectionCounts = new Map();
+  const defaults = [];
+
+  for (const submission of submissions) {
+    const areaKey = normalizeAreaOfFocusKey(submission.areaOfFocus);
+    const current = Number(areaSelectionCounts.get(areaKey) || 0);
+    if (current >= FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA) continue;
+
+    defaults.push(submission);
+    areaSelectionCounts.set(areaKey, current + 1);
+  }
+
+  return defaults;
 };
 
 const getFaceToFaceCandidates = async (year) => {
@@ -123,11 +146,11 @@ const getManualSelectionIdsForRound = async (roundId) => {
   return docs.map((item) => String(item.submissionId));
 };
 
-const buildSelectionIdSet = ({ candidates = [], topFiveIds = [], manualIds = [] }) => {
+const buildSelectionIdSet = ({ candidates = [], defaultIds = [], manualIds = [] }) => {
   const candidateIdSet = new Set(candidates.map((candidate) => String(candidate._id)));
   const selectedSet = new Set();
 
-  for (const id of topFiveIds) {
+  for (const id of defaultIds) {
     if (candidateIdSet.has(id)) selectedSet.add(id);
   }
 
@@ -136,6 +159,13 @@ const buildSelectionIdSet = ({ candidates = [], topFiveIds = [], manualIds = [] 
   }
 
   return selectedSet;
+};
+
+const sortByWeightedScore = (a, b) => {
+  if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+  if (b.faceToFaceAverage !== a.faceToFaceAverage) return b.faceToFaceAverage - a.faceToFaceAverage;
+  if (b.nationalAverage !== a.nationalAverage) return b.nationalAverage - a.nationalAverage;
+  return String(a.submissionId).localeCompare(String(b.submissionId));
 };
 
 const computeFaceToFaceScoreMaps = async ({ roundId, selectedSubmissionIds = [] }) => {
@@ -221,16 +251,17 @@ const computeFaceToFaceScoreMaps = async ({ roundId, selectedSubmissionIds = [] 
 const buildFaceToFaceDashboard = async ({ year }) => {
   const resolvedYear = resolveDashboardYear(year);
   const round = await ensureFaceToFaceRound(resolvedYear);
-  const [topFiveDocs, candidates, manualSelectionIds] = await Promise.all([
-    getDefaultTopFiveSubmissions(resolvedYear),
+  const [defaultSelectionDocs, candidates, manualSelectionIds] = await Promise.all([
+    getDefaultAreaScopedSubmissions(resolvedYear),
     getFaceToFaceCandidates(resolvedYear),
     getManualSelectionIdsForRound(round._id)
   ]);
 
-  const topFiveIds = topFiveDocs.map((item) => String(item._id));
+  const defaultSelectionIds = defaultSelectionDocs.map((item) => String(item._id));
+  const defaultSelectionIdSet = new Set(defaultSelectionIds);
   const selectedIdSet = buildSelectionIdSet({
     candidates,
-    topFiveIds,
+    defaultIds: defaultSelectionIds,
     manualIds: manualSelectionIds
   });
   const selectedIds = [...selectedIdSet];
@@ -254,6 +285,8 @@ const buildFaceToFaceDashboard = async ({ year }) => {
     );
     const assignedJudgeCount = (assignedJudgeIdsBySubmission.get(submissionId) || new Set()).size;
     const completedJudgeCount = (evaluatedJudgeIdsBySubmission.get(submissionId) || new Set()).size;
+    const areaLabel = getAreaOfFocusLabel(candidate.areaOfFocus);
+    const areaKey = normalizeAreaOfFocusKey(areaLabel);
 
     return {
       id: submissionId,
@@ -265,7 +298,8 @@ const buildFaceToFaceDashboard = async ({ year }) => {
       category: candidate.category || 'Unknown',
       class: candidate.class || 'Unknown',
       subject: candidate.subject || 'Unknown',
-      areaOfFocus: candidate.areaOfFocus || 'Unknown',
+      areaOfFocus: areaLabel,
+      areaKey,
       region: candidate.region || null,
       council: candidate.council || null,
       status: candidate.status || 'submitted',
@@ -275,7 +309,7 @@ const buildFaceToFaceDashboard = async ({ year }) => {
       assignedJudgeCount,
       completedJudgeCount,
       pendingJudgeCount: Math.max(assignedJudgeCount - completedJudgeCount, 0),
-      isTopFive: topFiveIds.includes(submissionId),
+      isDefaultSelected: defaultSelectionIdSet.has(submissionId),
       isManualSelected: manualSelectionIds.includes(submissionId),
       isSelected: selectedIdSet.has(submissionId),
       createdAt: candidate.createdAt || null,
@@ -285,16 +319,48 @@ const buildFaceToFaceDashboard = async ({ year }) => {
 
   const selectedRows = candidateRows
     .filter((row) => row.isSelected)
-    .sort((a, b) => {
-      if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
-      if (b.faceToFaceAverage !== a.faceToFaceAverage) return b.faceToFaceAverage - a.faceToFaceAverage;
-      if (b.nationalAverage !== a.nationalAverage) return b.nationalAverage - a.nationalAverage;
-      return String(a.submissionId).localeCompare(String(b.submissionId));
-    })
+    .sort(sortByWeightedScore)
     .map((row, index) => ({
       ...row,
       rank: index + 1
     }));
+
+  const areaGroupMap = new Map();
+  for (const row of candidateRows) {
+    if (!areaGroupMap.has(row.areaKey)) {
+      areaGroupMap.set(row.areaKey, {
+        areaKey: row.areaKey,
+        areaOfFocus: row.areaOfFocus,
+        candidates: []
+      });
+    }
+    areaGroupMap.get(row.areaKey).candidates.push(row);
+  }
+
+  const areaGroups = [...areaGroupMap.values()]
+    .map((group) => {
+      const sortedCandidates = [...group.candidates].sort(sortByWeightedScore);
+      const selectedInArea = sortedCandidates
+        .filter((row) => row.isSelected)
+        .map((row, index) => ({
+          ...row,
+          areaRank: index + 1
+        }));
+      const defaultInArea = sortedCandidates
+        .filter((row) => row.isDefaultSelected)
+        .map((row) => row.submissionId);
+      return {
+        areaKey: group.areaKey,
+        areaOfFocus: group.areaOfFocus,
+        candidateCount: sortedCandidates.length,
+        selectedCount: selectedInArea.length,
+        defaultSubmissionIds: defaultInArea,
+        candidates: sortedCandidates,
+        selectedSubmissions: selectedInArea,
+        leaderboard: selectedInArea
+      };
+    })
+    .sort((a, b) => String(a.areaOfFocus || '').localeCompare(String(b.areaOfFocus || '')));
 
   return {
     success: true,
@@ -311,9 +377,17 @@ const buildFaceToFaceDashboard = async ({ year }) => {
       faceToFace: FACE_TO_FACE_WEIGHT_PANEL
     },
     defaults: {
-      topFiveCount: NATIONAL_DEFAULT_SELECTION_COUNT
+      selectionsPerArea: FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA,
+      areaCount: areaGroups.length
     },
-    topFiveSubmissionIds: topFiveIds,
+    defaultSubmissionIds: defaultSelectionIds,
+    topFiveSubmissionIds: defaultSelectionIds,
+    defaultSelectionByArea: areaGroups.map((group) => ({
+      areaKey: group.areaKey,
+      areaOfFocus: group.areaOfFocus,
+      defaultSubmissionIds: group.defaultSubmissionIds
+    })),
+    areaGroups,
     candidateCount: candidateRows.length,
     selectedCount: selectedRows.length,
     candidates: candidateRows,
@@ -329,12 +403,12 @@ const updateFaceToFaceSelection = async ({
 }) => {
   const resolvedYear = resolveDashboardYear(year);
   const round = await ensureFaceToFaceRound(resolvedYear);
-  const [candidates, topFiveDocs] = await Promise.all([
+  const [candidates, defaultSelectionDocs] = await Promise.all([
     getFaceToFaceCandidates(resolvedYear),
-    getDefaultTopFiveSubmissions(resolvedYear)
+    getDefaultAreaScopedSubmissions(resolvedYear)
   ]);
   const candidateIdSet = new Set(candidates.map((candidate) => String(candidate._id)));
-  const topFiveIdSet = new Set(topFiveDocs.map((item) => String(item._id)));
+  const defaultSelectionIdSet = new Set(defaultSelectionDocs.map((item) => String(item._id)));
 
   const requestedIds = [...new Set((submissionIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
   const invalidIds = requestedIds.filter((id) => !candidateIdSet.has(id));
@@ -347,8 +421,8 @@ const updateFaceToFaceSelection = async ({
     };
   }
 
-  const finalSelectedSet = new Set([...topFiveIdSet, ...requestedIds]);
-  const manualSelectedIds = [...finalSelectedSet].filter((id) => !topFiveIdSet.has(id));
+  const finalSelectedSet = new Set([...defaultSelectionIdSet, ...requestedIds]);
+  const manualSelectedIds = [...finalSelectedSet].filter((id) => !defaultSelectionIdSet.has(id));
 
   const bulkOps = manualSelectedIds.map((submissionId) => ({
     updateOne: {
@@ -393,7 +467,7 @@ module.exports = {
   FACE_TO_FACE_ROUND_STAGE,
   FACE_TO_FACE_WEIGHT_NATIONAL,
   FACE_TO_FACE_WEIGHT_PANEL,
-  NATIONAL_DEFAULT_SELECTION_COUNT,
+  FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA,
   resolveDashboardYear,
   ensureFaceToFaceRound,
   buildFaceToFaceDashboard,

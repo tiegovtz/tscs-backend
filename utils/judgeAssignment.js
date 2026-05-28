@@ -17,7 +17,7 @@ const {
 const { getCanonicalAreaOfFocusLabel } = require('./areaOfFocus');
 
 const ACTIONABLE_ASSIGNMENT_STATUSES = new Set(['pending', 'submitted', 'under_review', 'evaluated']);
-const FACE_TO_FACE_DEFAULT_SELECTION_COUNT = 5;
+const FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA = 1;
 const LEGACY_GLOBAL_SUBMISSION_INDEX = 'submissionId_1';
 const LEGACY_SINGLE_ASSIGNMENT_INDEX = 'roundId_1_submissionId_1';
 const UNIQUE_JUDGE_ASSIGNMENT_INDEX = 'roundId_1_submissionId_1_judgeId_1';
@@ -190,6 +190,8 @@ const judgeMatchesAreaOfFocus = (judge, submissionAreaOfFocus) => {
   );
 };
 
+const normalizeAreaKey = (value) => normalizeAreaOfFocus(value) || 'unknown';
+
 const isFaceToFaceNationalRound = (round) => (
   String(round?.level || '') === 'National'
   && String(round?.stage || '') === 'face_to_face'
@@ -345,25 +347,33 @@ const getNationalRoundSubmissionIds = async (round) => {
 const getFaceToFaceSelectedSubmissionIds = async (round) => {
   if (!isFaceToFaceNationalRound(round)) return [];
 
-  const [manualSelections, topFive] = await Promise.all([
+  const [manualSelections, defaultsByAreaCandidates] = await Promise.all([
     FaceToFaceSelection.find({ roundId: round._id }).select('submissionId').lean(),
     Submission.find({
       year: Number(round.year),
       level: 'National',
-      status: 'promoted',
       isDeleted: { $ne: true },
       disqualified: { $ne: true }
     })
-      .select('_id')
+      .select('_id areaOfFocus')
       .sort({ averageScore: -1, createdAt: 1, _id: 1 })
-      .limit(FACE_TO_FACE_DEFAULT_SELECTION_COUNT)
       .lean()
   ]);
+
+  const areaSelectionCounts = new Map();
+  const defaultSubmissionIds = [];
+  for (const submission of defaultsByAreaCandidates) {
+    const areaKey = normalizeAreaKey(submission.areaOfFocus);
+    const current = Number(areaSelectionCounts.get(areaKey) || 0);
+    if (current >= FACE_TO_FACE_DEFAULT_SELECTIONS_PER_AREA) continue;
+    defaultSubmissionIds.push(String(submission._id));
+    areaSelectionCounts.set(areaKey, current + 1);
+  }
 
   return [
     ...new Set([
       ...manualSelections.map((item) => String(item.submissionId)),
-      ...topFive.map((item) => String(item._id))
+      ...defaultSubmissionIds
     ])
   ];
 };
