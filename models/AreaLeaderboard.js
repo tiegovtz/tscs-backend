@@ -63,6 +63,34 @@ const areaLeaderboardEntrySchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  submissionAverageScore: {
+    type: Number,
+    default: null
+  },
+  submissionMaxScore: {
+    type: Number,
+    default: null
+  },
+  videoWeightedScore: {
+    type: Number,
+    default: null
+  },
+  interviewAverageScore: {
+    type: Number,
+    default: null
+  },
+  interviewTotalEvaluations: {
+    type: Number,
+    default: 0
+  },
+  interviewWeightedScore: {
+    type: Number,
+    default: null
+  },
+  finalScore: {
+    type: Number,
+    default: null
+  },
   status: {
     type: String,
     enum: ['pending', 'evaluated', 'promoted', 'eliminated', 'disqualified'],

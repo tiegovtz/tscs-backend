@@ -32,6 +32,7 @@ const leaderboardRoutes = require("./routes/leaderboard");
 const stakeholderRoutes = require("./routes/stakeholder");
 const feedbackRoutes = require("./routes/feedback");
 const faceToFaceRoutes = require("./routes/faceToFace");
+const interviewRoutes = require("./routes/interviews");
 const { generalLimiter } = require("./middleware/rateLimiter");
 const requestTimeout = require("./middleware/timeout");
 
@@ -110,6 +111,7 @@ app.use("/api/leaderboard", leaderboardRoutes);
 app.use("/api/stakeholder", stakeholderRoutes);
 app.use("/api/feedback", feedbackRoutes);
 app.use("/api/face-to-face", faceToFaceRoutes);
+app.use("/api/interviews", interviewRoutes);
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {

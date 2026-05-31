@@ -6,10 +6,12 @@ const QuotaRule = require('../models/QuotaRule');
 const Quota = require('../models/Quota');
 const Submission = require('../models/Submission');
 const Evaluation = require('../models/Evaluation');
+const InterviewEvaluation = require('../models/InterviewEvaluation');
 const User = require('../models/User');
 const SubmissionAssignment = require('../models/SubmissionAssignment');
 const AreaLeaderboard = require('../models/AreaLeaderboard');
 const PromotionRecord = require('../models/PromotionRecord');
+const Competition = require('../models/Competition');
 const notificationService = require('../services/notificationService');
 const { getAdminScope } = require('./adminScope');
 const { resolveSubmissionRoundContext, isRoundActionable } = require('./roundContext');
@@ -19,6 +21,11 @@ const {
   normalizeAreaOfFocus,
   matchesAreaOfFocus
 } = require('./areaOfFocus');
+const {
+  getEvaluationCriteriaFromCompetition,
+  maxRubricTotal,
+  normalizeStoredCriteria
+} = require('./evaluationCriteria');
 
 const ROUND_LEVELS = ['Council', 'Regional', 'National'];
 const NATIONAL_FINAL_SELECTION_COUNT = 5;
@@ -742,6 +749,12 @@ const normalizeNumeric = (value, fallback = 0) => {
   return Number.isFinite(numeric) ? numeric : fallback;
 };
 
+const roundScore = (value, decimals = 2) => {
+  const numeric = normalizeNumeric(value);
+  const factor = 10 ** decimals;
+  return Math.round(numeric * factor) / factor;
+};
+
 const toPlainObject = (value) => (
   value && typeof value.toObject === 'function' ? value.toObject() : { ...value }
 );
@@ -753,14 +766,142 @@ const resolveTeacherId = (submission) => {
   return teacher;
 };
 
+const getRubricMaxScoresBySubmission = async (submissions = []) => {
+  const years = [...new Set(
+    submissions
+      .map((submission) => Number(submission?.year))
+      .filter((year) => Number.isFinite(year))
+  )];
+  const competitions = years.length > 0
+    ? await Competition.find({ year: { $in: years } }).select('year categories').lean()
+    : [];
+  const competitionByYear = new Map(competitions.map((competition) => [Number(competition.year), competition]));
+  const maxScoreBySubmission = new Map();
+
+  for (const submission of submissions) {
+    const submissionId = String(submission?._id || '');
+    if (!submissionId) continue;
+    const competition = competitionByYear.get(Number(submission.year));
+    const rawCriteria = getEvaluationCriteriaFromCompetition(
+      competition,
+      submission.category,
+      submission.class,
+      submission.subject,
+      submission.areaOfFocus
+    );
+    const normalized = normalizeStoredCriteria(rawCriteria || []);
+    const maxScore = maxRubricTotal(normalized);
+    maxScoreBySubmission.set(submissionId, maxScore > 0 ? maxScore : null);
+  }
+
+  return maxScoreBySubmission;
+};
+
+const getInterviewAverageMapForSubmissionIds = async ({ roundId, submissionIds }) => {
+  const submissionObjectIds = toObjectIdList(submissionIds);
+  if (submissionObjectIds.length === 0) return new Map();
+
+  const interviews = await InterviewEvaluation.find({
+    roundId,
+    level: 'National',
+    submissionId: { $in: submissionObjectIds }
+  })
+    .select('submissionId judgeId score')
+    .lean();
+
+  const grouped = new Map();
+  for (const interview of interviews) {
+    const submissionId = String(interview.submissionId);
+    if (!grouped.has(submissionId)) {
+      grouped.set(submissionId, { totalScore: 0, judgeIds: new Set() });
+    }
+    const current = grouped.get(submissionId);
+    current.totalScore += normalizeNumeric(interview.score);
+    if (interview.judgeId) current.judgeIds.add(String(interview.judgeId));
+  }
+
+  const averageMap = new Map();
+  for (const [submissionId, details] of grouped.entries()) {
+    const totalEvaluations = details.judgeIds.size;
+    averageMap.set(submissionId, {
+      averageScore: totalEvaluations > 0 ? roundScore(details.totalScore / totalEvaluations) : 0,
+      totalEvaluations,
+      judgeIds: details.judgeIds
+    });
+  }
+
+  return averageMap;
+};
+
+const buildNationalFinalScoreMap = async ({ round, submissions, evaluationMap }) => {
+  if (!round || round.level !== 'National') return new Map();
+
+  const [rubricMaxBySubmission, interviewMap] = await Promise.all([
+    getRubricMaxScoresBySubmission(submissions),
+    getInterviewAverageMapForSubmissionIds({
+      roundId: round._id,
+      submissionIds: submissions.map((submission) => submission?._id).filter(Boolean)
+    })
+  ]);
+
+  const finalScoreMap = new Map();
+  for (const submission of submissions) {
+    const submissionId = String(submission?._id || '');
+    if (!submissionId) continue;
+
+    const evaluation = evaluationMap.get(submissionId) || {};
+    const interview = interviewMap.get(submissionId) || {};
+    const submissionAverageScore = normalizeNumeric(evaluation.totalScore);
+    const submissionMaxScore = rubricMaxBySubmission.get(submissionId);
+    const videoWeightedScore = submissionMaxScore
+      ? roundScore((submissionAverageScore / submissionMaxScore) * 40)
+      : roundScore(normalizeNumeric(evaluation.averageScore) * 40);
+    const interviewAverageScore = normalizeNumeric(interview.averageScore);
+    const interviewWeightedScore = roundScore((interviewAverageScore / 100) * 60);
+    const finalScore = roundScore(videoWeightedScore + interviewWeightedScore);
+
+    finalScoreMap.set(submissionId, {
+      submissionAverageScore: roundScore(submissionAverageScore),
+      submissionMaxScore,
+      videoWeightedScore,
+      interviewAverageScore: interview.totalEvaluations > 0 ? interviewAverageScore : null,
+      interviewTotalEvaluations: Math.max(0, Math.floor(normalizeNumeric(interview.totalEvaluations))),
+      interviewWeightedScore: interview.totalEvaluations > 0 ? interviewWeightedScore : null,
+      finalScore
+    });
+  }
+
+  return finalScoreMap;
+};
+
+const resolveLeaderboardScoreFields = (scoreData = {}) => {
+  const hasFinalScore = scoreData.finalScore !== null
+    && scoreData.finalScore !== undefined
+    && Number.isFinite(Number(scoreData.finalScore));
+  const displayScore = hasFinalScore
+    ? normalizeNumeric(scoreData.finalScore)
+    : normalizeNumeric(scoreData.totalScore);
+
+  return {
+    averageScore: hasFinalScore ? displayScore : normalizeNumeric(scoreData.averageScore),
+    totalScore: displayScore,
+    totalEvaluations: Math.max(0, Math.floor(normalizeNumeric(scoreData.totalEvaluations))),
+    submissionAverageScore: scoreData.submissionAverageScore ?? null,
+    submissionMaxScore: scoreData.submissionMaxScore ?? null,
+    videoWeightedScore: scoreData.videoWeightedScore ?? null,
+    interviewAverageScore: scoreData.interviewAverageScore ?? null,
+    interviewTotalEvaluations: Math.max(0, Math.floor(normalizeNumeric(scoreData.interviewTotalEvaluations))),
+    interviewWeightedScore: scoreData.interviewWeightedScore ?? null,
+    finalScore: hasFinalScore ? displayScore : null
+  };
+};
+
 const buildLeaderboardEntryFromSubmission = (submission, scoreData = null) => {
   const resolvedScoreData = scoreData || {};
   const resolvedTeacherId = resolveTeacherId(submission);
   if (!resolvedTeacherId) return null;
-  const totalEvaluations = Math.max(
-    0,
-    Math.floor(normalizeNumeric(resolvedScoreData.totalEvaluations))
-  );
+  const scoreFields = resolveLeaderboardScoreFields(resolvedScoreData);
+  const totalEvaluations = scoreFields.totalEvaluations;
 
   let status = totalEvaluations > 0 ? 'evaluated' : 'pending';
   if (submission?.disqualified === true || submission?.status === 'disqualified') {
@@ -784,9 +925,7 @@ const buildLeaderboardEntryFromSubmission = (submission, scoreData = null) => {
     subject: submission?.subject || 'Unknown',
     areaOfFocus: submission?.areaOfFocus || 'Unknown',
     rank: 0,
-    averageScore: normalizeNumeric(resolvedScoreData.averageScore),
-    totalScore: normalizeNumeric(resolvedScoreData.totalScore),
-    totalEvaluations,
+    ...scoreFields,
     status,
     tieBreakCreatedAt: submission?.createdAt || null
   };
@@ -842,12 +981,28 @@ const syncLeaderboardScoresFromEvaluations = async (
     roundIdsCache.set(roundKey, roundIds);
   }
 
-  const evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
-    year: leaderboard.year,
-    level: leaderboard.level,
-    submissionIds,
-    roundIds
-  });
+  let evaluationMap;
+  let finalScoreMap = new Map();
+  if (leaderboard.level === 'National') {
+    const sourceRoundId = leaderboard.metadata?.sourceRoundId || leaderboard.roundId;
+    const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
+      roundId: sourceRoundId,
+      submissionIds
+    });
+    evaluationMap = panelResult.evaluationMap;
+    finalScoreMap = await buildNationalFinalScoreMap({
+      round: { _id: sourceRoundId, level: 'National' },
+      submissions: plainAreaSubmissions,
+      evaluationMap
+    });
+  } else {
+    evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
+      year: leaderboard.year,
+      level: leaderboard.level,
+      submissionIds,
+      roundIds
+    });
+  }
 
   let changed = false;
   const updatedEntries = plainEntries.map((entry) => {
@@ -860,9 +1015,26 @@ const syncLeaderboardScoresFromEvaluations = async (
     const fallbackTotal = normalizeNumeric(entry.totalScore);
     const fallbackCount = Math.max(0, Math.floor(normalizeNumeric(entry.totalEvaluations)));
 
-    const nextAverage = scoreData ? normalizeNumeric(scoreData.averageScore) : fallbackAverage;
-    const nextTotal = scoreData ? normalizeNumeric(scoreData.totalScore) : fallbackTotal;
-    const nextCount = scoreData ? Math.max(0, Math.floor(normalizeNumeric(scoreData.totalEvaluations))) : fallbackCount;
+    const nextScoreFields = scoreData
+      ? resolveLeaderboardScoreFields({
+          ...scoreData,
+          ...(finalScoreMap.get(entryId) || {})
+        })
+      : {
+          averageScore: fallbackAverage,
+          totalScore: fallbackTotal,
+          totalEvaluations: fallbackCount,
+          submissionAverageScore: entry.submissionAverageScore ?? null,
+          submissionMaxScore: entry.submissionMaxScore ?? null,
+          videoWeightedScore: entry.videoWeightedScore ?? null,
+          interviewAverageScore: entry.interviewAverageScore ?? null,
+          interviewTotalEvaluations: Math.max(0, Math.floor(normalizeNumeric(entry.interviewTotalEvaluations))),
+          interviewWeightedScore: entry.interviewWeightedScore ?? null,
+          finalScore: entry.finalScore ?? null
+        };
+    const nextAverage = nextScoreFields.averageScore;
+    const nextTotal = nextScoreFields.totalScore;
+    const nextCount = nextScoreFields.totalEvaluations;
 
     let nextStatus = entry.status;
     if (!['promoted', 'eliminated', 'disqualified'].includes(nextStatus)) {
@@ -885,15 +1057,16 @@ const syncLeaderboardScoresFromEvaluations = async (
       || fallbackCount !== nextCount
       || String(entry.status || '') !== String(nextStatus || '')
       || String(entry.areaOfFocus || '') !== String(nextAreaOfFocus || '')
+      || !approximatelyEqual(entry.finalScore, nextScoreFields.finalScore)
+      || !approximatelyEqual(entry.interviewAverageScore, nextScoreFields.interviewAverageScore)
+      || !approximatelyEqual(entry.interviewWeightedScore, nextScoreFields.interviewWeightedScore)
     ) {
       changed = true;
     }
 
     const nextEntry = {
       ...entry,
-      averageScore: nextAverage,
-      totalScore: nextTotal,
-      totalEvaluations: nextCount,
+      ...nextScoreFields,
       status: nextStatus,
       areaOfFocus: nextAreaOfFocus
     };
@@ -931,7 +1104,10 @@ const syncLeaderboardScoresFromEvaluations = async (
       totalScore: 0,
       totalEvaluations: 0
     };
-    const builtEntry = buildLeaderboardEntryFromSubmission(submission, scoreData);
+    const builtEntry = buildLeaderboardEntryFromSubmission(submission, {
+      ...scoreData,
+      ...(finalScoreMap.get(submissionId) || {})
+    });
     if (!builtEntry) {
       console.warn(`Skipping leaderboard entry without teacherId for submission ${submissionId}`);
       continue;
@@ -1871,12 +2047,18 @@ const rebuildAreaLeaderboard = async (roundId, areaId, options = {}) => {
     .map((submission) => (submission && typeof submission.toObject === 'function' ? submission.toObject() : submission));
   const submissionIds = submissions.map((submission) => submission._id);
   let evaluationMap;
+  let finalScoreMap = new Map();
   if (round.level === 'National') {
     const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
       roundId: round._id,
       submissionIds
     });
     evaluationMap = panelResult.evaluationMap;
+    finalScoreMap = await buildNationalFinalScoreMap({
+      round,
+      submissions,
+      evaluationMap
+    });
   } else {
     const roundIds = await getRoundIdsForYearLevel(round.year, round.level);
     evaluationMap = await getLatestEvaluationJudgeSetsBySubmission({
@@ -1893,6 +2075,11 @@ const rebuildAreaLeaderboard = async (roundId, areaId, options = {}) => {
       totalScore: 0,
       totalEvaluations: 0
     };
+    const nationalFinalScoreData = finalScoreMap.get(String(submission._id)) || {};
+    const leaderboardScoreFields = resolveLeaderboardScoreFields({
+      ...scoreData,
+      ...nationalFinalScoreData
+    });
     const entry = {
       submissionId: submission._id,
       teacherId: submission.teacherId?._id || submission.teacherId,
@@ -1906,10 +2093,8 @@ const rebuildAreaLeaderboard = async (roundId, areaId, options = {}) => {
       subject: submission.subject || 'Unknown',
       areaOfFocus: submission.areaOfFocus || 'Unknown',
       rank: 0,
-      averageScore: scoreData.averageScore,
-      totalScore: scoreData.totalScore,
-      totalEvaluations: scoreData.totalEvaluations,
-      status: scoreData.totalEvaluations > 0 ? 'evaluated' : 'pending',
+      ...leaderboardScoreFields,
+      status: leaderboardScoreFields.totalEvaluations > 0 ? 'evaluated' : 'pending',
       tieBreakCreatedAt: submission.createdAt || null
     };
 
