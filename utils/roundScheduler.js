@@ -26,7 +26,10 @@ const checkAndProcessRounds = async () => {
 
     // Transition active rounds to ended when their timer finishes.
     // Manual superadmin approval/publish flow handles promotions and closure.
-    const activeRounds = await CompetitionRound.find({ status: 'active' });
+    const activeRounds = await CompetitionRound.find({
+      status: 'active',
+      stage: { $ne: 'face_to_face' }
+    });
     for (const round of activeRounds) {
       await activateDueChunksForRound(round);
 
@@ -61,7 +64,11 @@ const checkAndProcessRounds = async () => {
     }
 
     // Optionally auto-close rounds that are ended and already finalized across all areas.
-    const endedRounds = await CompetitionRound.find({ status: 'ended', autoAdvance: true });
+    const endedRounds = await CompetitionRound.find({
+      status: 'ended',
+      autoAdvance: true,
+      stage: { $ne: 'face_to_face' }
+    });
     for (const round of endedRounds) {
       const leaderboards = await AreaLeaderboard.find({
         roundId: round._id,

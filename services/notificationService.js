@@ -1,5 +1,6 @@
 const Notification = require('../models/Notification');
 const emailService = require('./emailService');
+const smsService = require('./smsService');
 const User = require('../models/User');
 
 /**
@@ -102,7 +103,7 @@ class NotificationService {
    * @param {Object} data - System notification data
    */
   async handleSystemNotification(data) {
-    const { userId, title, message, metadata, sendEmail = false } = data;
+    const { userId, title, message, metadata, sendEmail = false, sendSMS = false } = data;
 
     // Create in-app notification
     const notification = await this.createNotification({
@@ -114,10 +115,11 @@ class NotificationService {
       isSystem: true
     });
 
-    // Send email if requested
+    // Send email if requested (email service also sends SMS when phone is available).
     if (sendEmail && userId) {
       try {
         const user = await User.findById(userId).select('email name phone');
+        let sentViaEmailService = false;
         if (user && user.email) {
           const emailSent = await emailService.sendSystemNotification(
             user.email,
@@ -134,9 +136,31 @@ class NotificationService {
             notification.emailSentAt = new Date();
             await notification.save();
           }
+
+          sentViaEmailService = true;
+        }
+
+        // Fallback SMS path: when requested and email channel was not used.
+        if ((sendSMS || sendEmail) && user?.phone && !sentViaEmailService) {
+          const smsText = `TSCS: ${title}. ${message}`;
+          await smsService.sendSMS(user.phone, smsText);
         }
       } catch (error) {
         console.error('Failed to send system notification email:', error);
+      }
+      return;
+    }
+
+    // SMS-only path
+    if (sendSMS && userId) {
+      try {
+        const user = await User.findById(userId).select('phone');
+        if (user?.phone) {
+          const smsText = `TSCS: ${title}. ${message}`;
+          await smsService.sendSMS(user.phone, smsText);
+        }
+      } catch (error) {
+        console.error('Failed to send system notification SMS:', error);
       }
     }
   }

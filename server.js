@@ -31,6 +31,7 @@ const notificationRoutes = require("./routes/notifications");
 const leaderboardRoutes = require("./routes/leaderboard");
 const stakeholderRoutes = require("./routes/stakeholder");
 const feedbackRoutes = require("./routes/feedback");
+const faceToFaceRoutes = require("./routes/faceToFace");
 const { generalLimiter } = require("./middleware/rateLimiter");
 const requestTimeout = require("./middleware/timeout");
 
@@ -108,6 +109,7 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/leaderboard", leaderboardRoutes);
 app.use("/api/stakeholder", stakeholderRoutes);
 app.use("/api/feedback", feedbackRoutes);
+app.use("/api/face-to-face", faceToFaceRoutes);
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {

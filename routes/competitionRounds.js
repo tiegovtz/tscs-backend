@@ -17,9 +17,14 @@ const {
   approveAreaLeaderboardAndPromote,
   rebuildAreaLeaderboard,
   ensureChunkAreasDoNotOverlap,
-  addSubmissionToActiveRoundSnapshot
+  addSubmissionToActiveRoundSnapshot,
+  updateRoundSubmissionsFromScope,
+  autoReassignUnassignedSubmissionsForRound
 } = require('../utils/roundJudgementService');
 const { manuallyAssignSubmission } = require('../utils/judgeAssignment');
+const {
+  getCanonicalAreaOfFocusLabel
+} = require('../utils/areaOfFocus');
 
 // Safely import logger
 let logger = null;
@@ -225,6 +230,8 @@ router.use(protect);
 router.get('/active', cacheMiddleware(60), async (req, res) => {
   try {
     const user = req.user;
+    const includeFaceToFace = String(req.query.includeFaceToFace || '').toLowerCase() === 'true';
+    const stageFilter = includeFaceToFace ? {} : { stage: { $ne: 'face_to_face' } };
 
     if (!user) {
       return res.json({
@@ -241,14 +248,18 @@ router.get('/active', cacheMiddleware(60), async (req, res) => {
       // or latest ended round as fallback while finishing pending tasks.
       const levelRounds = await CompetitionRound.find({
         level: user.assignedLevel,
-        status: { $in: ['active', 'ended'] }
+        status: { $in: ['active', 'ended'] },
+        ...stageFilter
       }).sort({ createdAt: -1 });
 
       const activeRound = levelRounds.find((round) => round.status === 'active') || null;
       const endedRound = levelRounds.find((round) => round.status === 'ended') || null;
       rounds = activeRound ? [activeRound] : endedRound ? [endedRound] : [];
     } else if (user.role === 'stakeholder') {
-      const latestActiveRound = await CompetitionRound.findOne({ status: 'active' })
+      const latestActiveRound = await CompetitionRound.findOne({
+        status: 'active',
+        ...stageFilter
+      })
         .sort({ updatedAt: -1, createdAt: -1 });
       rounds = latestActiveRound ? [latestActiveRound] : [];
     }
@@ -287,12 +298,17 @@ router.use((req, res, next) => {
 // @access  Private (Superadmin)
 router.get('/', async (req, res) => {
   try {
-    const { year, level, status } = req.query;
+    const { year, level, status, stage, includeFaceToFace } = req.query;
     
     let query = {};
     if (year) query.year = parseInt(year);
     if (level) query.level = level;
     if (status) query.status = status;
+    if (stage) {
+      query.stage = stage;
+    } else if (String(includeFaceToFace || '').toLowerCase() !== 'true') {
+      query.stage = { $ne: 'face_to_face' };
+    }
 
     const rounds = await CompetitionRound.find(query)
       .populate('closedBy', 'name email')
@@ -601,6 +617,7 @@ router.post('/', async (req, res) => {
     const {
       year,
       level,
+      stage,
       timingType,
       endTime,
       startTime,
@@ -646,9 +663,11 @@ router.post('/', async (req, res) => {
     }
 
     // National single timeline: only one draft/pending/active round per year + level.
+    const normalizedStage = stage === 'face_to_face' ? 'face_to_face' : 'standard';
     const existingQuery = {
       year: parseInt(year),
       level,
+      stage: normalizedStage,
       status: { $in: ['draft', 'pending', 'active'] }
     };
 
@@ -676,6 +695,7 @@ router.post('/', async (req, res) => {
     const roundData = {
       year: parseInt(year),
       level,
+      stage: normalizedStage,
       timingType,
       endTime: actualEndTime,
       startTime: startTime ? new Date(startTime) : null,
@@ -782,6 +802,16 @@ router.put('/:id', async (req, res) => {
     }
     if (typeof updateData.council !== 'undefined') {
       updateData.council = null;
+    }
+
+    if (typeof updateData.stage !== 'undefined') {
+      if (!['standard', 'face_to_face'].includes(String(updateData.stage))) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid stage value'
+        });
+      }
+      updateData.stage = String(updateData.stage);
     }
     
     // Recalculate end time if timing changed
@@ -1574,6 +1604,53 @@ router.post('/:id/submissions', authorize('superadmin'), invalidateCacheOnChange
   }
 });
 
+// @route   POST /api/competition-rounds/:id/submissions/update
+// @route   POST /api/competition-rounds/:id/update-submissions
+// @desc    Backfill missing in-scope submissions into an active round and auto-assign judges
+// @access  Private (Superadmin)
+router.post(['/:id/submissions/update', '/:id/update-submissions'], authorize('superadmin'), invalidateCacheOnChange(['cache:/api/submissions*', 'cache:/api/competition-rounds*', 'cache:/api/leaderboard*']), async (req, res) => {
+  try {
+    const result = await updateRoundSubmissionsFromScope(req.params.id);
+    if (!result.success) {
+      return res.status(result.status || 400).json({
+        success: false,
+        message: result.message || 'Failed to update round submissions'
+      });
+    }
+
+    if (logger) {
+      logger.logAdminAction(
+        'Superadmin updated active round submissions from scope',
+        req.user._id,
+        req,
+        {
+          roundId: req.params.id,
+          level: result.level,
+          scopeSubmissions: result.scopeSubmissions,
+          existingInRound: result.existingInRound,
+          addedSubmissions: result.addedSubmissions,
+          assignments: result.assignments,
+          chunking: result.chunking
+        },
+        'success',
+        'update'
+      ).catch(() => {});
+    }
+
+    return res.json({
+      success: true,
+      message: `Round submissions updated. Added ${result.addedSubmissions} submission(s) and created ${result.assignments?.assigned || 0} assignment(s).`,
+      ...result
+    });
+  } catch (error) {
+    console.error('Update round submissions from scope error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error'
+    });
+  }
+});
+
 // @route   GET /api/competition-rounds/:id/leaderboard
 // @desc    Get area leaderboards for a competition round
 // @access  Private (Superadmin)
@@ -1711,37 +1788,60 @@ router.get('/:id/judge-progress', async (req, res) => {
     const requestedRegion = normalize(req.query.region);
     const requestedCouncilRaw = normalize(req.query.council);
     const requestedGroupBy = normalize(req.query.groupBy).toLowerCase();
+    const requestedAreaIdRaw = normalize(req.query.areaId);
     const isCouncilRound = round.level === 'Council';
+    const isNationalRound = round.level === 'National';
     const requestedCouncil = isCouncilRound ? requestedCouncilRaw : '';
 
-    if (requestedCouncil && !requestedRegion) {
+    if (!isNationalRound && requestedCouncil && !requestedRegion) {
       return res.status(400).json({
         success: false,
         message: 'Council filter requires a region filter'
       });
     }
 
-    const scopedRegion = requestedRegion || normalize(round.region);
-    const scopedCouncil = isCouncilRound ? (requestedCouncil || normalize(round.council)) : '';
-    const scopeRegionRegex = toExactRegex(scopedRegion);
-    const scopeCouncilRegex = toExactRegex(scopedCouncil);
+    const scopedRegion = isNationalRound
+      ? ''
+      : (requestedRegion || normalize(round.region));
+    const scopedCouncil = isNationalRound
+      ? ''
+      : (isCouncilRound ? (requestedCouncil || normalize(round.council)) : '');
+    const scopeRegionRegex = isNationalRound ? null : toExactRegex(scopedRegion);
+    const scopeCouncilRegex = isNationalRound ? null : toExactRegex(scopedCouncil);
 
     const requestedGrouping = ['regions', 'councils'].includes(requestedGroupBy)
       ? requestedGroupBy
       : (scopedCouncil || scopedRegion ? 'councils' : 'regions');
-    const groupBy = isCouncilRound
-      ? requestedGrouping
-      : 'regions';
+    const groupBy = isNationalRound
+      ? 'areas_of_focus'
+      : (isCouncilRound ? requestedGrouping : 'regions');
 
-    const buildAreaKey = (submissionOrAssignment) => {
-      const region = submissionOrAssignment?.region ? String(submissionOrAssignment.region).trim() : '';
-      const council = submissionOrAssignment?.council ? String(submissionOrAssignment.council).trim() : '';
+    const getAreaOfFocusLabel = (submission) => {
+      const label = getCanonicalAreaOfFocusLabel(submission?.areaOfFocus || submission?.category || '');
+      return label || 'Unknown';
+    };
+
+    const normalizedRequestedAreaId = isNationalRound
+      ? String(getCanonicalAreaOfFocusLabel(requestedAreaIdRaw) || requestedAreaIdRaw || '').trim().toLowerCase()
+      : requestedAreaIdRaw.toLowerCase();
+    const matchesRequestedArea = (areaKey) => {
+      if (!requestedAreaIdRaw) return true;
+      const normalizedAreaKey = String(areaKey || '').trim().toLowerCase();
+      return normalizedAreaKey === normalizedRequestedAreaId;
+    };
+
+    const buildAreaKey = (submission) => {
+      if (isNationalRound) {
+        return getAreaOfFocusLabel(submission);
+      }
+      const region = submission?.region ? String(submission.region).trim() : '';
+      const council = submission?.council ? String(submission.council).trim() : '';
       if (groupBy === 'councils') {
         return region && council ? `${region}::${council}` : null;
       }
       return region || null;
     };
-    
+
     let snapshotSubmissionIds = Array.isArray(round.pendingSubmissionsSnapshot)
       ? round.pendingSubmissionsSnapshot
       : [];
@@ -1784,12 +1884,12 @@ router.get('/:id/judge-progress', async (req, res) => {
             isDeleted: { $ne: true }
           }
         : {
-          year: round.year,
-          level: round.level,
-          status: { $nin: activeRoundSubmissionStatusExclusions },
-          disqualified: { $ne: true },
-          isDeleted: { $ne: true }
-        };
+            year: round.year,
+            level: round.level,
+            status: { $nin: activeRoundSubmissionStatusExclusions },
+            disqualified: { $ne: true },
+            isDeleted: { $ne: true }
+          };
     if (scopeRegionRegex) submissionQuery.region = scopeRegionRegex;
     if (isCouncilRound && scopeCouncilRegex) submissionQuery.council = scopeCouncilRegex;
 
@@ -1798,6 +1898,7 @@ router.get('/:id/judge-progress', async (req, res) => {
     const submissionById = new Map(
       allSubmissions.map((submission) => [String(submission._id), submission])
     );
+
     const levelRoundIds = await CompetitionRound.find({
       year: round.year,
       level: round.level
@@ -1823,27 +1924,20 @@ router.get('/:id/judge-progress', async (req, res) => {
       levelEvaluatedSubmissionIds.map((evaluationId) => String(evaluationId))
     );
 
-    // Get all judges assigned to this round's level and location
     const judgeQuery = { role: 'judge', assignedLevel: round.level, status: 'active' };
-    if (scopeCouncilRegex && scopeRegionRegex) {
-      judgeQuery.assignedRegion = scopeRegionRegex;
-      judgeQuery.assignedCouncil = scopeCouncilRegex;
-    } else if (scopeRegionRegex) {
-      judgeQuery.assignedRegion = scopeRegionRegex;
+    if (!isNationalRound) {
+      if (scopeCouncilRegex && scopeRegionRegex) {
+        judgeQuery.assignedRegion = scopeRegionRegex;
+        judgeQuery.assignedCouncil = scopeCouncilRegex;
+      } else if (scopeRegionRegex) {
+        judgeQuery.assignedRegion = scopeRegionRegex;
+      }
     }
+    const judges = await User.find(judgeQuery).select(
+      '_id name email username assignedLevel assignedRegion assignedCouncil areasOfFocus'
+    );
 
-    // Get full judge details (including name, email, username) for both progress calculation and export
-    const judges = await User.find(judgeQuery).select('_id name email username assignedLevel assignedRegion assignedCouncil areasOfFocus');
-
-    // Area stats for charts: total vs assigned per area (to detect unassigned submissions).
-    const areaTotalsMap = new Map();
-    for (const submission of allSubmissions) {
-      const key = buildAreaKey(submission);
-      if (!key) continue;
-      areaTotalsMap.set(key, (areaTotalsMap.get(key) || 0) + 1);
-    }
-
-    const assignmentDocsForAreaStatsRaw = (round.level === 'Council' || round.level === 'Regional') && allSubmissionIds.length > 0
+    const assignmentsRaw = allSubmissionIds.length > 0
       ? await SubmissionAssignment.find({
           roundId: round._id,
           level: round.level,
@@ -1853,49 +1947,69 @@ router.get('/:id/judge-progress', async (req, res) => {
           .sort({ assignedAt: -1, createdAt: -1, _id: -1 })
           .lean()
       : [];
-    const assignmentDocsForAreaStats = [];
+
     const latestAssignmentBySubmissionId = new Map();
-    for (const assignment of assignmentDocsForAreaStatsRaw) {
-      const submissionId = String(assignment.submissionId);
-      if (!latestAssignmentBySubmissionId.has(submissionId)) {
+    const assignmentDocsForProgress = [];
+    if (isNationalRound) {
+      const seenPairs = new Set();
+      const panelJudgeIdsBySubmission = new Map();
+      const assignmentsByPanelOrder = [...assignmentsRaw].sort((a, b) => {
+        const aAssignedAt = new Date(a.assignedAt || a.createdAt || 0).getTime();
+        const bAssignedAt = new Date(b.assignedAt || b.createdAt || 0).getTime();
+        if (aAssignedAt !== bAssignedAt) return aAssignedAt - bAssignedAt;
+        const aCreatedAt = new Date(a.createdAt || a.assignedAt || 0).getTime();
+        const bCreatedAt = new Date(b.createdAt || b.assignedAt || 0).getTime();
+        if (aCreatedAt !== bCreatedAt) return aCreatedAt - bCreatedAt;
+        return String(a._id || '').localeCompare(String(b._id || ''));
+      });
+      for (const assignment of assignmentsByPanelOrder) {
+        const submissionId = String(assignment.submissionId);
+        const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+        if (!judgeId) continue;
+        const pairKey = `${submissionId}::${judgeId}`;
+        if (seenPairs.has(pairKey)) continue;
+        seenPairs.add(pairKey);
+
+        if (!panelJudgeIdsBySubmission.has(submissionId)) {
+          panelJudgeIdsBySubmission.set(submissionId, []);
+        }
+        const panelJudgeIds = panelJudgeIdsBySubmission.get(submissionId);
+        if (!panelJudgeIds.includes(judgeId)) {
+          if (panelJudgeIds.length >= 3) continue;
+          panelJudgeIds.push(judgeId);
+        }
+        assignmentDocsForProgress.push(assignment);
+      }
+    } else {
+      for (const assignment of assignmentsRaw) {
+        const submissionId = String(assignment.submissionId);
+        if (latestAssignmentBySubmissionId.has(submissionId)) continue;
         latestAssignmentBySubmissionId.set(submissionId, assignment);
-        assignmentDocsForAreaStats.push(assignment);
+        assignmentDocsForProgress.push(assignment);
       }
     }
 
-    const areaAssignedSetMap = new Map();
-    for (const assignment of assignmentDocsForAreaStats) {
-      const submission = submissionById.get(String(assignment.submissionId));
-      if (!submission) continue;
+    const assignedSubmissionIdsByJudge = new Map();
+    const assignedJudgeIdsBySubmission = new Map();
+    for (const assignment of assignmentDocsForProgress) {
+      const submissionId = String(assignment.submissionId);
+      const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+      if (!judgeId) continue;
+      if (!assignedSubmissionIdsByJudge.has(judgeId)) {
+        assignedSubmissionIdsByJudge.set(judgeId, new Set());
+      }
+      assignedSubmissionIdsByJudge.get(judgeId).add(submissionId);
+      if (!assignedJudgeIdsBySubmission.has(submissionId)) {
+        assignedJudgeIdsBySubmission.set(submissionId, new Set());
+      }
+      assignedJudgeIdsBySubmission.get(submissionId).add(judgeId);
+    }
+
+    const areaTotalsMap = new Map();
+    for (const submission of allSubmissions) {
       const key = buildAreaKey(submission);
       if (!key) continue;
-      if (!areaAssignedSetMap.has(key)) {
-        areaAssignedSetMap.set(key, new Set());
-      }
-      areaAssignedSetMap.get(key).add(String(assignment.submissionId));
-    }
-    const areaAssignedMap = new Map(
-      [...areaAssignedSetMap.entries()].map(([key, submissionSet]) => [key, submissionSet.size])
-    );
-
-    const areaUnassignedSetMap = new Map();
-    for (const submission of allSubmissions) {
-      const areaKey = buildAreaKey(submission);
-      if (!areaKey) continue;
-      const submissionId = String(submission._id);
-      const status = String(submission.status || '').toLowerCase();
-      const isAssigned = latestAssignmentBySubmissionId.has(submissionId);
-      const isEvaluated = levelEvaluatedSubmissionIdSet.has(submissionId)
-        || submission.disqualified === true
-        || status === 'disqualified'
-        || status === 'evaluated';
-
-      if (isAssigned || isEvaluated) continue;
-
-      if (!areaUnassignedSetMap.has(areaKey)) {
-        areaUnassignedSetMap.set(areaKey, new Set());
-      }
-      areaUnassignedSetMap.get(areaKey).add(submissionId);
+      areaTotalsMap.set(key, (areaTotalsMap.get(key) || 0) + 1);
     }
 
     const evaluationsForScopedSubmissions = allSubmissionIds.length > 0
@@ -1916,149 +2030,306 @@ router.get('/:id/judge-progress', async (req, res) => {
         .map((evaluation) => `${String(evaluation.submissionId)}::${String(evaluation.judgeId)}`)
     );
 
+    const areaAssignedSubmissionSetMap = new Map();
+    const areaUnassignedSetMap = new Map();
     const areaCompletedSetMap = new Map();
     const areaActiveJudgeSetMap = new Map();
+    const areaTotalAssignmentsMap = new Map();
+    const areaCompletedAssignmentsMap = new Map();
+
+    const requiredNationalEvaluators = 3;
+
+    for (const assignment of assignmentDocsForProgress) {
+      const submission = submissionById.get(String(assignment.submissionId));
+      if (!submission) continue;
+      const areaKey = buildAreaKey(submission);
+      if (!areaKey) continue;
+      const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+      if (!judgeId) continue;
+
+      if (!areaActiveJudgeSetMap.has(areaKey)) {
+        areaActiveJudgeSetMap.set(areaKey, new Set());
+      }
+      areaActiveJudgeSetMap.get(areaKey).add(judgeId);
+
+      areaTotalAssignmentsMap.set(areaKey, (areaTotalAssignmentsMap.get(areaKey) || 0) + 1);
+      if (evaluatedSubmissionJudgePairSet.has(`${String(assignment.submissionId)}::${judgeId}`)) {
+        areaCompletedAssignmentsMap.set(areaKey, (areaCompletedAssignmentsMap.get(areaKey) || 0) + 1);
+      }
+    }
+
     for (const submission of allSubmissions) {
       const areaKey = buildAreaKey(submission);
       if (!areaKey) continue;
       const submissionId = String(submission._id);
+      const status = String(submission.status || '').toLowerCase();
+      const assignedJudgeIds = assignedJudgeIdsBySubmission.get(submissionId) || new Set();
+      const assignedCount = assignedJudgeIds.size;
 
-      if (round.level === 'Council' || round.level === 'Regional') {
-        const latestAssignment = latestAssignmentBySubmissionId.get(submissionId);
-        const latestJudgeId = latestAssignment?.judgeId ? String(latestAssignment.judgeId) : null;
-        if (!latestJudgeId) continue;
-
-        if (!areaActiveJudgeSetMap.has(areaKey)) {
-          areaActiveJudgeSetMap.set(areaKey, new Set());
+      if (isNationalRound) {
+        const isFullyAssigned = assignedCount >= requiredNationalEvaluators;
+        if (isFullyAssigned) {
+          if (!areaAssignedSubmissionSetMap.has(areaKey)) {
+            areaAssignedSubmissionSetMap.set(areaKey, new Set());
+          }
+          areaAssignedSubmissionSetMap.get(areaKey).add(submissionId);
+        } else {
+          if (!areaUnassignedSetMap.has(areaKey)) {
+            areaUnassignedSetMap.set(areaKey, new Set());
+          }
+          areaUnassignedSetMap.get(areaKey).add(submissionId);
         }
-        areaActiveJudgeSetMap.get(areaKey).add(latestJudgeId);
 
-        if (evaluatedSubmissionJudgePairSet.has(`${submissionId}::${latestJudgeId}`)) {
+        const isComplete = isFullyAssigned
+          && [...assignedJudgeIds].every((judgeId) =>
+            evaluatedSubmissionJudgePairSet.has(`${submissionId}::${judgeId}`)
+          );
+        if (isComplete) {
           if (!areaCompletedSetMap.has(areaKey)) {
             areaCompletedSetMap.set(areaKey, new Set());
           }
           areaCompletedSetMap.get(areaKey).add(submissionId);
         }
-      } else if (evaluatedSubmissionIdSet.has(submissionId)) {
-        if (!areaCompletedSetMap.has(areaKey)) {
-          areaCompletedSetMap.set(areaKey, new Set());
+      } else {
+        const latestAssignment = latestAssignmentBySubmissionId.get(submissionId);
+        const latestJudgeId = latestAssignment?.judgeId ? String(latestAssignment.judgeId) : null;
+        const isAssigned = Boolean(latestJudgeId);
+        const isEvaluated = levelEvaluatedSubmissionIdSet.has(submissionId)
+          || submission.disqualified === true
+          || status === 'disqualified'
+          || status === 'evaluated';
+
+        if (isAssigned) {
+          if (!areaAssignedSubmissionSetMap.has(areaKey)) {
+            areaAssignedSubmissionSetMap.set(areaKey, new Set());
+          }
+          areaAssignedSubmissionSetMap.get(areaKey).add(submissionId);
+        } else if (!isEvaluated) {
+          if (!areaUnassignedSetMap.has(areaKey)) {
+            areaUnassignedSetMap.set(areaKey, new Set());
+          }
+          areaUnassignedSetMap.get(areaKey).add(submissionId);
         }
-        areaCompletedSetMap.get(areaKey).add(submissionId);
+
+        if (latestJudgeId && evaluatedSubmissionJudgePairSet.has(`${submissionId}::${latestJudgeId}`)) {
+          if (!areaCompletedSetMap.has(areaKey)) {
+            areaCompletedSetMap.set(areaKey, new Set());
+          }
+          areaCompletedSetMap.get(areaKey).add(submissionId);
+        }
       }
     }
 
-    const areaStats = [...new Set([...areaTotalsMap.keys(), ...areaAssignedMap.keys()])]
-      .map((areaId) => ({
-        areaId,
-        totalSubmissions: areaTotalsMap.get(areaId) || 0,
-        assignedSubmissions: areaAssignedMap.get(areaId) || 0,
-        unassignedSubmissions: areaUnassignedSetMap.get(areaId)?.size || 0,
-        completedSubmissions: areaCompletedSetMap.get(areaId)?.size || 0,
-        activeJudges: areaActiveJudgeSetMap.get(areaId)?.size || 0
-      }))
+    const areaAssignedMap = new Map(
+      [...areaAssignedSubmissionSetMap.entries()].map(([key, submissionSet]) => [key, submissionSet.size])
+    );
+
+    const areaKeys = [...new Set([
+      ...areaTotalsMap.keys(),
+      ...areaAssignedMap.keys(),
+      ...areaTotalAssignmentsMap.keys()
+    ])];
+    const areaStats = areaKeys
+      .map((areaId) => {
+        const totalSubmissions = areaTotalsMap.get(areaId) || 0;
+        const assignedSubmissions = areaAssignedMap.get(areaId) || 0;
+        const unassignedSubmissions = areaUnassignedSetMap.get(areaId)?.size || 0;
+        const completedSubmissions = areaCompletedSetMap.get(areaId)?.size || 0;
+        const activeJudges = areaActiveJudgeSetMap.get(areaId)?.size || 0;
+        const totalAssignments = areaTotalAssignmentsMap.get(areaId) || 0;
+        const completedAssignments = areaCompletedAssignmentsMap.get(areaId) || 0;
+        const pendingAssignments = Math.max(totalAssignments - completedAssignments, 0);
+        return {
+          areaId,
+          totalSubmissions,
+          assignedSubmissions,
+          unassignedSubmissions,
+          completedSubmissions,
+          activeJudges,
+          totalAssignments,
+          completedAssignments,
+          pendingAssignments
+        };
+      })
       .sort((a, b) => b.totalSubmissions - a.totalSubmissions);
 
-    // Get all submissions for this round (used for overall stats)
-    let submissions;
-    if (round.level === 'Council' || round.level === 'Regional') {
-      // For Council/Regional: Get submissions that have assignments
-      const assignedSubmissionIds = new Set(
-        assignmentDocsForAreaStats.map((assignment) => String(assignment.submissionId))
-      );
-      submissions = allSubmissions.filter(sub => 
-        assignedSubmissionIds.has(sub._id.toString())
-      );
-    } else {
-      // National level: Judges see all submissions at National level (not filtered by areaOfFocus)
-      submissions = allSubmissions;
-    }
-
-    const assignedSubmissionIdsByJudge = new Map();
-    for (const assignment of assignmentDocsForAreaStats) {
-      const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
-      if (!judgeId) continue;
-      if (!assignedSubmissionIdsByJudge.has(judgeId)) {
-        assignedSubmissionIdsByJudge.set(judgeId, new Set());
-      }
-      assignedSubmissionIdsByJudge.get(judgeId).add(String(assignment.submissionId));
-    }
-
-    // Calculate progress for each judge
-    const submissionIds = submissions.map(sub => sub._id);
     const judgeProgress = await Promise.all(judges.map(async (judge) => {
-      const evaluationQuery = { 
+      const judgeId = String(judge._id);
+      const assignedIds = assignedSubmissionIdsByJudge.get(judgeId) || new Set();
+      const assignedSubmissionIds = [...assignedIds];
+
+      const evaluationQuery = {
         roundId: round._id,
         level: round.level,
         judgeId: judge._id
       };
-      if (submissionIds.length > 0) {
-        evaluationQuery.submissionId = { $in: submissionIds };
-      }
-      const evaluations = await Evaluation.find(evaluationQuery);
-      const evaluatedSubmissionIds = evaluations.map(e => e.submissionId.toString());
-      
-      let assignedSubmissions;
-      if (round.level === 'Council' || round.level === 'Regional') {
-        // For Council/Regional: Get only submissions assigned to this judge
-        const assignedIds = assignedSubmissionIdsByJudge.get(String(judge._id)) || new Set();
-        assignedSubmissions = submissions.filter(sub => 
-          assignedIds.has(sub._id.toString())
-        );
+      if (assignedSubmissionIds.length > 0) {
+        evaluationQuery.submissionId = { $in: assignedSubmissionIds };
       } else {
-        // National level: Judges see ALL submissions at National level (not filtered by areaOfFocus)
-        assignedSubmissions = submissions;
+        evaluationQuery.submissionId = { $in: [] };
       }
+      const evaluations = await Evaluation.find(evaluationQuery).select('submissionId').lean();
+      const evaluatedSubmissionIds = new Set(
+        evaluations.map((evaluation) => String(evaluation.submissionId))
+      );
 
-      // Count completed using evaluations explicitly tied to this round.
-      const completed = assignedSubmissions.filter(sub => 
-        evaluatedSubmissionIds.includes(sub._id.toString())
-      ).length;
+      const pendingSubmissionIds = assignedSubmissionIds.filter(
+        (submissionId) => !evaluatedSubmissionIds.has(submissionId)
+      );
 
-      const total = assignedSubmissions.length;
-      const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
+      const assignedAreaOfFocuses = [...new Set(
+        assignedSubmissionIds
+          .map((submissionId) => submissionById.get(submissionId))
+          .filter(Boolean)
+          .map((submission) => getAreaOfFocusLabel(submission))
+      )].sort((a, b) => a.localeCompare(b));
+
+      const totalAssigned = assignedSubmissionIds.length;
+      const completed = totalAssigned - pendingSubmissionIds.length;
+      const percentage = totalAssigned > 0 ? Math.round((completed / totalAssigned) * 100) : 0;
 
       return {
-        judgeId: judge._id.toString(),
+        judgeId,
         judgeName: judge.name,
         judgeEmail: judge.email,
         judgeUsername: judge.username,
         assignedLevel: judge.assignedLevel,
         assignedRegion: judge.assignedRegion,
         assignedCouncil: judge.assignedCouncil,
-        totalAssigned: total,
-        completed: completed,
-        pending: total - completed,
-        percentage: percentage,
-        assignedSubmissionIds: assignedSubmissions.map(sub => sub._id.toString()),
-        pendingSubmissionIds: assignedSubmissions
-          .filter(sub => !evaluatedSubmissionIds.includes(sub._id.toString()))
-          .map(sub => sub._id.toString())
+        assignedAreaOfFocuses,
+        totalAssigned,
+        completed,
+        pending: pendingSubmissionIds.length,
+        percentage,
+        assignedSubmissionIds,
+        pendingSubmissionIds
       };
     }));
 
-    // Calculate overall statistics
+    const judgeById = new Map(
+      judges.map((judge) => [String(judge._id), judge])
+    );
+
+    let selectedAreaDetails = null;
+    if (requestedAreaIdRaw) {
+      const areaSubmissions = allSubmissions.filter((submission) => {
+        const areaKey = buildAreaKey(submission);
+        return areaKey && matchesRequestedArea(areaKey);
+      });
+      const areaSubmissionIds = new Set(
+        areaSubmissions.map((submission) => String(submission._id))
+      );
+
+      const submissionRows = areaSubmissions
+        .map((submission) => {
+          const submissionId = String(submission._id);
+          const assignedJudgeIds = [
+            ...(assignedJudgeIdsBySubmission.get(submissionId) || new Set())
+          ];
+          const assignedJudges = assignedJudgeIds.map((judgeId) => {
+            const judge = judgeById.get(judgeId);
+            const completed = evaluatedSubmissionJudgePairSet.has(`${submissionId}::${judgeId}`);
+            return {
+              judgeId,
+              judgeName: judge?.name || judge?.username || judge?.email || 'Unknown',
+              completed
+            };
+          });
+          const completedAssignments = assignedJudges.filter((judgeRow) => judgeRow.completed).length;
+          return {
+            id: submissionId,
+            submissionId,
+            title: submission.title || submission.topic || submission.category || submission.subject || 'Untitled',
+            teacherName: submission.teacherName || submission.teacherId?.name || 'Unknown',
+            school: submission.school || 'Unknown',
+            status: submission.status || 'submitted',
+            submittedAt: submission.submittedAt || submission.updatedAt || submission.createdAt || null,
+            assignedEvaluations: assignedJudges.length,
+            completedEvaluations: completedAssignments,
+            assignedJudges
+          };
+        })
+        .sort((a, b) => new Date(b.submittedAt || 0) - new Date(a.submittedAt || 0));
+
+      const judgeRows = judgeProgress
+        .map((judgeRow) => {
+          const assignedInArea = (judgeRow.assignedSubmissionIds || []).filter((submissionId) =>
+            areaSubmissionIds.has(String(submissionId))
+          );
+          if (assignedInArea.length === 0) {
+            return null;
+          }
+          const pendingInArea = (judgeRow.pendingSubmissionIds || []).filter((submissionId) =>
+            areaSubmissionIds.has(String(submissionId))
+          );
+          const completedInArea = Math.max(assignedInArea.length - pendingInArea.length, 0);
+          return {
+            judgeId: judgeRow.judgeId,
+            judgeName: judgeRow.judgeName,
+            judgeEmail: judgeRow.judgeEmail,
+            totalAssigned: assignedInArea.length,
+            completed: completedInArea,
+            pending: pendingInArea.length,
+            percentage: assignedInArea.length > 0
+              ? Math.round((completedInArea / assignedInArea.length) * 100)
+              : 0
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.totalAssigned - a.totalAssigned || a.judgeName.localeCompare(b.judgeName));
+
+      const resolvedAreaLabel = areaSubmissions.length > 0
+        ? (buildAreaKey(areaSubmissions[0]) || requestedAreaIdRaw)
+        : requestedAreaIdRaw;
+
+      selectedAreaDetails = {
+        areaId: resolvedAreaLabel,
+        areaLabel: resolvedAreaLabel,
+        totalSubmissions: submissionRows.length,
+        submissions: submissionRows,
+        judges: judgeRows
+      };
+    }
+
     const totalSubmissions = allSubmissions.length;
     const totalJudges = judges.length;
-    let totalEvaluations;
-    if (round.level === 'Council' || round.level === 'Regional') {
-      const latestAssignedCompletedSubmissionIds = new Set();
-      for (const assignment of assignmentDocsForAreaStats) {
-        const submissionId = String(assignment.submissionId);
-        const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
-        if (!judgeId) continue;
-        if (evaluatedSubmissionJudgePairSet.has(`${submissionId}::${judgeId}`)) {
-          latestAssignedCompletedSubmissionIds.add(submissionId);
-        }
-      }
-      totalEvaluations = latestAssignedCompletedSubmissionIds.size;
-    } else {
-      totalEvaluations = evaluatedSubmissionIdSet.size;
-    }
+    const totalEvaluations = isNationalRound
+      ? [...evaluatedSubmissionJudgePairSet].filter((pair) => {
+          const [submissionId, judgeId] = pair.split('::');
+          const assignedJudgeIds = assignedJudgeIdsBySubmission.get(submissionId);
+          return Boolean(assignedJudgeIds && assignedJudgeIds.has(judgeId));
+        }).length
+      : (() => {
+          const latestAssignedCompletedSubmissionIds = new Set();
+          for (const assignment of assignmentDocsForProgress) {
+            const submissionId = String(assignment.submissionId);
+            const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+            if (!judgeId) continue;
+            if (evaluatedSubmissionJudgePairSet.has(`${submissionId}::${judgeId}`)) {
+              latestAssignedCompletedSubmissionIds.add(submissionId);
+            }
+          }
+          return latestAssignedCompletedSubmissionIds.size;
+        })();
     const averageProgress = judgeProgress.length > 0
-      ? Math.round(judgeProgress.reduce((sum, j) => sum + j.percentage, 0) / judgeProgress.length)
+      ? Math.round(judgeProgress.reduce((sum, judgeRow) => sum + judgeRow.percentage, 0) / judgeProgress.length)
       : 0;
-    const totalAssignedSubmissions = areaStats.reduce((sum, area) => sum + (Number(area.assignedSubmissions) || 0), 0);
-    const totalUnassignedSubmissions = areaStats.reduce((sum, area) => sum + (Number(area.unassignedSubmissions) || 0), 0);
+    const totalAssignedSubmissions = areaStats.reduce(
+      (sum, areaRow) => sum + (Number(areaRow.assignedSubmissions) || 0),
+      0
+    );
+    const totalUnassignedSubmissions = areaStats.reduce(
+      (sum, areaRow) => sum + (Number(areaRow.unassignedSubmissions) || 0),
+      0
+    );
+    const totalAssignedEvaluations = areaStats.reduce(
+      (sum, areaRow) => sum + (Number(areaRow.totalAssignments) || 0),
+      0
+    );
+    const totalCompletedEvaluations = areaStats.reduce(
+      (sum, areaRow) => sum + (Number(areaRow.completedAssignments) || 0),
+      0
+    );
 
     // Calculate actual end time for time remaining
     const getActualEndTime = () => {
@@ -2089,19 +2360,24 @@ router.get('/:id/judge-progress', async (req, res) => {
         totalEvaluations,
         averageProgress,
         totalAssignedSubmissions,
-        totalUnassignedSubmissions
+        totalUnassignedSubmissions,
+        totalAssignedEvaluations,
+        totalCompletedEvaluations
       },
       judgeProgress,
       areaStats,
+      selectedAreaDetails,
       assignmentSummary: {
         totalSubmissions,
         assignedSubmissions: totalAssignedSubmissions,
-        unassignedSubmissions: totalUnassignedSubmissions
+        unassignedSubmissions: totalUnassignedSubmissions,
+        assignedEvaluations: totalAssignedEvaluations,
+        completedEvaluations: totalCompletedEvaluations
       },
       locationContext: {
         groupBy,
-        region: scopedRegion || null,
-        council: isCouncilRound ? (scopedCouncil || null) : null,
+        region: isNationalRound ? null : (scopedRegion || null),
+        council: isNationalRound ? null : (isCouncilRound ? (scopedCouncil || null) : null),
         dataScope: hasSnapshotContext ? 'snapshot' : (roundScopedSubmissionExists ? 'roundId' : 'legacy-year-level')
       }
     });
@@ -2170,27 +2446,37 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     const page = parsePositiveInt(req.query.page, 1);
     const limit = parsePositiveInt(req.query.limit, 20);
     const isCouncilRound = round.level === 'Council';
-    const requestedCouncil = isCouncilRound ? requestedCouncilRaw : '';
+    const isNationalRound = round.level === 'National';
+    const requestedCouncil = isCouncilRound && !isNationalRound ? requestedCouncilRaw : '';
 
-    if (requestedCouncil && !requestedRegion) {
+    if (!isNationalRound && requestedCouncil && !requestedRegion) {
       return res.status(400).json({
         success: false,
         message: 'Council filter requires a region filter'
       });
     }
 
-    const scopedRegion = requestedRegion || normalize(round.region);
-    const scopedCouncil = isCouncilRound ? (requestedCouncil || normalize(round.council)) : '';
+    const scopedRegion = isNationalRound
+      ? ''
+      : (requestedRegion || normalize(round.region));
+    const scopedCouncil = isNationalRound
+      ? ''
+      : (isCouncilRound ? (requestedCouncil || normalize(round.council)) : '');
     const scopedAreaOfFocus = requestedAreaOfFocus;
-    const scopeRegionRegex = toExactRegex(scopedRegion);
-    const scopeCouncilRegex = toExactRegex(scopedCouncil);
+    const scopeRegionRegex = isNationalRound ? null : toExactRegex(scopedRegion);
+    const scopeCouncilRegex = isNationalRound ? null : toExactRegex(scopedCouncil);
     const scopeAreaOfFocusRegex = toExactRegex(scopedAreaOfFocus);
-    const requestedGrouping = ['regions', 'councils'].includes(requestedGroupBy)
+    const requestedGrouping = ['regions', 'councils', 'areas_of_focus'].includes(requestedGroupBy)
       ? requestedGroupBy
       : (scopedCouncil || scopedRegion ? 'councils' : 'regions');
-    const groupBy = isCouncilRound ? requestedGrouping : 'regions';
+    const groupBy = isNationalRound
+      ? 'areas_of_focus'
+      : (isCouncilRound ? requestedGrouping : 'regions');
 
     const buildAreaKey = (record, targetGrouping = groupBy) => {
+      if (targetGrouping === 'areas_of_focus') {
+        return getCanonicalAreaOfFocusLabel(record?.areaOfFocus || record?.category || '') || 'Unknown';
+      }
       const region = record?.region ? String(record.region).trim() : '';
       const council = record?.council ? String(record.council).trim() : '';
       if (targetGrouping === 'councils') {
@@ -2276,26 +2562,61 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
         roundId: { $in: levelRoundIds }
       });
     }
-    const historicalAssignedSubmissionIds = allSubmissionIds.length > 0
-      ? await SubmissionAssignment.distinct('submissionId', {
-          roundId: round._id,
-          level: round.level,
-          submissionId: { $in: allSubmissionIds }
-        })
-      : [];
     const evaluatedSubmissionIds = allSubmissionIds.length > 0
       ? await Evaluation.distinct('submissionId', {
           submissionId: { $in: allSubmissionIds },
           $or: evaluationScope
         })
       : [];
-    const assignedOrEvaluatedSubmissionIdSet = new Set([
-      ...historicalAssignedSubmissionIds.map((id) => String(id)),
-      ...evaluatedSubmissionIds.map((id) => String(id))
-    ]);
-    const unassignedSubmissions = allSubmissions.filter(
-      (submission) => !assignedOrEvaluatedSubmissionIdSet.has(String(submission._id))
-    );
+    const evaluatedSubmissionIdSet = new Set(evaluatedSubmissionIds.map((id) => String(id)));
+
+    let unassignedSubmissions = [];
+    if (isNationalRound) {
+      const assignmentDocs = allSubmissionIds.length > 0
+        ? await SubmissionAssignment.find({
+            roundId: round._id,
+            level: round.level,
+            submissionId: { $in: allSubmissionIds }
+          })
+            .select('submissionId judgeId assignedAt createdAt')
+            .sort({ assignedAt: 1, createdAt: 1, _id: 1 })
+            .lean()
+        : [];
+      const panelJudgeIdsBySubmission = new Map();
+      for (const assignment of assignmentDocs) {
+        const submissionId = String(assignment.submissionId);
+        const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+        if (!judgeId) continue;
+        if (!panelJudgeIdsBySubmission.has(submissionId)) {
+          panelJudgeIdsBySubmission.set(submissionId, []);
+        }
+        const panelJudgeIds = panelJudgeIdsBySubmission.get(submissionId);
+        if (panelJudgeIds.includes(judgeId)) continue;
+        if (panelJudgeIds.length >= 3) continue;
+        panelJudgeIds.push(judgeId);
+      }
+      unassignedSubmissions = allSubmissions.filter((submission) => {
+        const submissionId = String(submission._id);
+        if (evaluatedSubmissionIdSet.has(submissionId)) return false;
+        const panelJudgeIds = panelJudgeIdsBySubmission.get(submissionId) || [];
+        return panelJudgeIds.length < 3;
+      });
+    } else {
+      const historicalAssignedSubmissionIds = allSubmissionIds.length > 0
+        ? await SubmissionAssignment.distinct('submissionId', {
+            roundId: round._id,
+            level: round.level,
+            submissionId: { $in: allSubmissionIds }
+          })
+        : [];
+      const assignedOrEvaluatedSubmissionIdSet = new Set([
+        ...historicalAssignedSubmissionIds.map((id) => String(id)),
+        ...evaluatedSubmissionIds.map((id) => String(id))
+      ]);
+      unassignedSubmissions = allSubmissions.filter(
+        (submission) => !assignedOrEvaluatedSubmissionIdSet.has(String(submission._id))
+      );
+    }
 
     const areaOfFocusTotalsMap = new Map();
     for (const submission of allSubmissions) {
@@ -2347,7 +2668,7 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     const distribution = [...distributionMap.values()]
       .sort((a, b) => b.unassignedSubmissions - a.unassignedSubmissions);
 
-    const childGrouping = isCouncilRound ? 'councils' : 'regions';
+    const childGrouping = isNationalRound ? 'areas_of_focus' : (isCouncilRound ? 'councils' : 'regions');
     const childTotalsMap = new Map();
     for (const submission of allSubmissions) {
       const key = buildAreaKey(submission, childGrouping);
@@ -2416,6 +2737,20 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
         const totalCount = childTotalsMap.get(key) || 0;
         const assignedEvaluationCount = Math.max(totalCount - unassignedCount, 0);
 
+        if (childGrouping === 'areas_of_focus') {
+          return {
+            areaId: key,
+            areaLabel: key,
+            region: null,
+            council: null,
+            areaOfFocus: key,
+            totalSubmissions: totalCount,
+            assignedEvaluationCount,
+            unassignedSubmissions: unassignedCount,
+            adminName: null
+          };
+        }
+
         if (childGrouping === 'councils') {
           const [region, council] = String(key).split('::');
           const adminName = councilAdminMap.get(String(key).toLowerCase()) || null;
@@ -2469,7 +2804,9 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
       assignedJudgeEmail: null,
       areaAdminName: round.level === 'Council'
         ? (councilAdminMap.get(`${String(submission.region || '').trim()}::${String(submission.council || '').trim()}`.toLowerCase()) || null)
-        : (regionalAdminMap.get(String(submission.region || '').trim().toLowerCase()) || null),
+        : round.level === 'Regional'
+          ? (regionalAdminMap.get(String(submission.region || '').trim().toLowerCase()) || null)
+          : null,
       submittedAt: submission.submittedAt || submission.updatedAt || submission.createdAt || null,
       createdAt: submission.createdAt || null
     }));
@@ -2484,8 +2821,8 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
       },
       locationContext: {
         groupBy,
-        region: scopedRegion || null,
-        council: isCouncilRound ? (scopedCouncil || null) : null,
+        region: isNationalRound ? null : (scopedRegion || null),
+        council: isNationalRound ? null : (isCouncilRound ? (scopedCouncil || null) : null),
         areaOfFocus: scopedAreaOfFocus || null,
         dataScope: hasSnapshotContext ? 'snapshot' : (roundScopedSubmissionExists ? 'roundId' : 'legacy-year-level')
       },
@@ -2508,6 +2845,65 @@ router.get('/:id/unassigned-dashboard', async (req, res) => {
     });
   } catch (error) {
     console.error('Get unassigned dashboard error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error'
+    });
+  }
+});
+
+// @route   POST /api/competition-rounds/:id/unassigned-dashboard/auto-reassign
+// @desc    Auto-assign unassigned submissions for this round using current assignment rules
+// @access  Private (Superadmin/National Admin)
+router.post('/:id/unassigned-dashboard/auto-reassign', invalidateCacheOnChange(['cache:/api/submissions*', 'cache:/api/competition-rounds*']), async (req, res) => {
+  try {
+    const isSuperadmin = req.user?.role === 'superadmin';
+    const isNationalAdmin = req.user?.role === 'admin' && req.user?.adminLevel === 'National';
+    if (!isSuperadmin && !isNationalAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to auto reassign unassigned submissions'
+      });
+    }
+
+    const result = await autoReassignUnassignedSubmissionsForRound(req.params.id, {
+      region: req.body?.region || null,
+      council: req.body?.council || null,
+      areaOfFocus: req.body?.areaOfFocus || null
+    });
+
+    if (!result.success) {
+      return res.status(result.status || 400).json({
+        success: false,
+        message: result.message || 'Failed to auto reassign submissions'
+      });
+    }
+
+    if (logger) {
+      logger.logAdminAction(
+        'Auto reassigned unassigned submissions for round',
+        req.user._id,
+        req,
+        {
+          roundId: req.params.id,
+          level: result.level,
+          scopedSubmissions: result.scopedSubmissions,
+          eligibleForAssignment: result.eligibleForAssignment,
+          assigned: result.assigned,
+          remainingUnassigned: result.remainingUnassigned
+        },
+        'success',
+        'update'
+      ).catch(() => {});
+    }
+
+    return res.json({
+      success: true,
+      message: `Auto reassign completed. ${result.assigned} assignment(s) created.`,
+      ...result
+    });
+  } catch (error) {
+    console.error('Auto reassign unassigned submissions error:', error);
     return res.status(500).json({
       success: false,
       message: error.message || 'Server error'

@@ -16,6 +16,31 @@ try {
 
 const router = express.Router();
 
+const TEACHER_HIDDEN_NOTIFICATION_TYPES = ['evaluation_reminder', 'evaluation_pending', 'judge_assigned'];
+
+const sanitizeNotificationForTeacher = (notification) => {
+  if (!notification) return notification;
+  const plain = (typeof notification.toObject === 'function')
+    ? notification.toObject()
+    : { ...notification };
+
+  if (plain.metadata && typeof plain.metadata === 'object') {
+    const sanitizedMetadata = { ...plain.metadata };
+    delete sanitizedMetadata.averageScore;
+    delete sanitizedMetadata.totalScore;
+    delete sanitizedMetadata.score;
+    delete sanitizedMetadata.rank;
+    delete sanitizedMetadata.totalSubmissions;
+    delete sanitizedMetadata.totalEvaluations;
+    delete sanitizedMetadata.evaluations;
+    delete sanitizedMetadata.judgeCompleted;
+    delete sanitizedMetadata.judgeCompletionStatus;
+    plain.metadata = sanitizedMetadata;
+  }
+
+  return plain;
+};
+
 // All routes require authentication
 router.use(protect);
 
@@ -35,12 +60,24 @@ router.get('/', async (req, res) => {
     const { read, type, limit = 50 } = req.query;
     
     let query = { userId: req.user._id };
+
+    if (req.user.role === 'teacher') {
+      query.type = { $nin: TEACHER_HIDDEN_NOTIFICATION_TYPES };
+    }
     
     if (read !== undefined) {
       query.read = read === 'true';
     }
     
     if (type) {
+      if (req.user.role === 'teacher' && TEACHER_HIDDEN_NOTIFICATION_TYPES.includes(type)) {
+        return res.json({
+          success: true,
+          count: 0,
+          unreadCount: 0,
+          notifications: []
+        });
+      }
       query.type = type;
     }
 
@@ -49,17 +86,25 @@ router.get('/', async (req, res) => {
       .limit(parseInt(limit));
 
     // Get unread count
-    const unreadCount = await Notification.countDocuments({
+    const unreadQuery = {
       userId: req.user._id,
       read: false
-    });
+    };
+    if (req.user.role === 'teacher') {
+      unreadQuery.type = { $nin: TEACHER_HIDDEN_NOTIFICATION_TYPES };
+    }
+    const unreadCount = await Notification.countDocuments(unreadQuery);
+
+    const visibleNotifications = req.user.role === 'teacher'
+      ? notifications.map((notification) => sanitizeNotificationForTeacher(notification))
+      : notifications;
 
     if (!res.headersSent) {
       res.json({
         success: true,
-        count: notifications.length,
+        count: visibleNotifications.length,
         unreadCount: unreadCount || 0,
-        notifications
+        notifications: visibleNotifications
       });
     }
   } catch (error) {
@@ -86,10 +131,14 @@ router.get('/unread-count', async (req, res) => {
       });
     }
 
-    const count = await Notification.countDocuments({
+    const countQuery = {
       userId: req.user._id,
       read: false
-    });
+    };
+    if (req.user.role === 'teacher') {
+      countQuery.type = { $nin: TEACHER_HIDDEN_NOTIFICATION_TYPES };
+    }
+    const count = await Notification.countDocuments(countQuery);
 
     if (!res.headersSent) {
       res.json({
@@ -312,4 +361,3 @@ router.post('/send', authorize('admin', 'superadmin'), async (req, res) => {
 });
 
 module.exports = router;
-

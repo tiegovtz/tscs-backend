@@ -43,6 +43,22 @@ const getMissingSubmissionParts = (submission) => {
   return missingParts;
 };
 
+const sanitizeSubmissionForTeacher = (submission) => {
+  if (!submission) return submission;
+  const plain = (typeof submission.toObject === 'function')
+    ? submission.toObject()
+    : { ...submission };
+  delete plain.score;
+  delete plain.averageScore;
+  delete plain.totalScore;
+  delete plain.totalEvaluations;
+  delete plain.evaluationDetails;
+  delete plain.evaluations;
+  delete plain.judgeCompleted;
+  delete plain.judgeCompletionStatus;
+  return plain;
+};
+
 const buildMissingMediaQuery = () => ({
   $or: [
     { lessonPlanFileUrl: { $exists: false } },
@@ -158,19 +174,22 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
         .select('submissionId roundId assignedAt createdAt')
         .lean();
 
-      const assignmentPairs = assignmentsForJudge.map((assignment) => ({
-        _id: assignment.submissionId
-      }));
-      judgeAssignmentMap = new Map(
-        assignmentsForJudge.map((assignment) => [
-          String(assignment.submissionId),
-          {
-            roundId: assignment.roundId,
-            assignedAt: assignment.assignedAt,
-            createdAt: assignment.createdAt
-          }
-        ])
-      );
+      const assignmentPairs = [];
+      judgeAssignmentMap = new Map();
+      const seenSubmissionIds = new Set();
+      for (const assignment of assignmentsForJudge) {
+        const submissionId = String(assignment.submissionId);
+        if (seenSubmissionIds.has(submissionId)) {
+          continue;
+        }
+        seenSubmissionIds.add(submissionId);
+        assignmentPairs.push({ _id: assignment.submissionId });
+        judgeAssignmentMap.set(submissionId, {
+          roundId: assignment.roundId,
+          assignedAt: assignment.assignedAt,
+          createdAt: assignment.createdAt
+        });
+      }
       judgeAssignmentsCount = assignmentPairs.length;
 
       if (assignmentPairs.length > 0) {
@@ -185,45 +204,94 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
       query.$and = andClauses;
     }
 
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = parseInt(limit, 10) || 20;
-    const skip = (pageNum - 1) * limitNum;
+    const requestedPageNum = parseInt(page, 10) || 1;
+    const requestedLimitNum = parseInt(limit, 10) || 20;
 
     const total = await Submission.countDocuments(query);
-    const submissions = await Submission.find(query)
+    const shouldReturnAllForJudge = req.user.role === 'judge';
+    const pageNum = shouldReturnAllForJudge ? 1 : requestedPageNum;
+    const limitNum = shouldReturnAllForJudge
+      ? Math.max(total, 1)
+      : requestedLimitNum;
+    const skip = (pageNum - 1) * limitNum;
+
+    let submissionsQuery = Submission.find(query)
       .populate('teacherId', 'name email username')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum)
-      .lean();
+      .sort({ createdAt: -1 });
+    if (!shouldReturnAllForJudge) {
+      submissionsQuery = submissionsQuery.skip(skip).limit(limitNum);
+    }
+    const submissions = await submissionsQuery.lean();
 
     if (req.user.role === 'judge' && submissions.length > 0) {
       const submissionIds = submissions.map((submission) => submission._id);
+      const assignedRoundIds = [
+        ...new Set(
+          [...judgeAssignmentMap.values()]
+            .map((meta) => (meta?.roundId ? String(meta.roundId) : null))
+            .filter(Boolean)
+        )
+      ];
+      const roundStageById = new Map();
+      if (assignedRoundIds.length > 0) {
+        const rounds = await CompetitionRound.find({
+          _id: { $in: assignedRoundIds }
+        }).select('_id stage').lean();
+        for (const round of rounds) {
+          roundStageById.set(String(round._id), round.stage || 'standard');
+        }
+      }
+
       const evaluationDocs = await Evaluation.find({
         submissionId: { $in: submissionIds },
-        judgeId: req.user._id
-      }).select('submissionId').lean();
+        judgeId: req.user._id,
+        ...(assignedRoundIds.length > 0
+          ? { roundId: { $in: assignedRoundIds } }
+          : {})
+      }).select('submissionId roundId').lean();
 
-      const evaluatedSubmissionIds = new Set(evaluationDocs.map((evaluation) => String(evaluation.submissionId)));
+      const evaluatedSubmissionIds = new Set();
+      const evaluatedPairs = new Set();
+      for (const evaluation of evaluationDocs) {
+        const submissionId = String(evaluation.submissionId);
+        evaluatedSubmissionIds.add(submissionId);
+        if (evaluation.roundId) {
+          evaluatedPairs.add(`${submissionId}::${String(evaluation.roundId)}`);
+        }
+      }
+
 
       for (const submission of submissions) {
         const submissionId = String(submission._id);
         const assignedMeta = judgeAssignmentMap.get(submissionId) || null;
-        const judgeCompleted = evaluatedSubmissionIds.has(submissionId);
+        const assignedRoundId = assignedMeta?.roundId
+          ? String(assignedMeta.roundId)
+          : (submission.roundId ? String(submission.roundId) : null);
+        const judgeCompleted = assignedRoundId
+          ? evaluatedPairs.has(`${submissionId}::${assignedRoundId}`)
+          : evaluatedSubmissionIds.has(submissionId);
         submission.judgeCompleted = judgeCompleted;
         submission.judgeCompletionStatus = judgeCompleted ? 'completed' : 'pending';
-        submission.assignedRoundId = assignedMeta?.roundId || submission.roundId || null;
+        submission.assignedRoundId = assignedRoundId;
+        submission.assignedRoundStage = assignedRoundId
+          ? (roundStageById.get(assignedRoundId) || null)
+          : null;
       }
     }
 
+    const visibleSubmissions = req.user.role === 'teacher'
+      ? submissions.map((submission) => sanitizeSubmissionForTeacher(submission))
+      : submissions;
+
     const response = {
       success: true,
-      count: submissions.length,
+      count: visibleSubmissions.length,
       total,
       page: pageNum,
-      pages: Math.ceil(total / limitNum),
+      pages: shouldReturnAllForJudge ? 1 : Math.ceil(total / limitNum),
       limit: limitNum,
-      submissions
+      allResults: shouldReturnAllForJudge,
+      submissions: visibleSubmissions
     };
 
     if (responseMessage) {
@@ -970,7 +1038,7 @@ router.patch('/:id/teacher-reupload', authorize('teacher'), invalidateCacheOnCha
     res.json({
       success: true,
       message: `${part === 'lessonPlan' ? 'Lesson plan' : 'Video'} reuploaded successfully`,
-      submission
+      submission: sanitizeSubmissionForTeacher(submission)
     });
   } catch (error) {
     console.error('Teacher reupload error:', error);
@@ -1032,11 +1100,25 @@ router.get('/:id', async (req, res) => {
             message: 'Not authorized to access this submission'
           });
         }
-      } else if (submission.level === 'National' && req.user.assignedLevel !== 'National') {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to access this submission'
+      } else if (submission.level === 'National') {
+        if (req.user.assignedLevel !== 'National') {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this submission'
+          });
+        }
+
+        const hasNationalAssignment = await SubmissionAssignment.exists({
+          submissionId: submission._id,
+          judgeId: req.user._id,
+          level: 'National'
         });
+        if (!hasNationalAssignment) {
+          return res.status(403).json({
+            success: false,
+            message: 'Not authorized to access this submission'
+          });
+        }
       }
     }
 
@@ -1061,9 +1143,13 @@ router.get('/:id', async (req, res) => {
       'read'
     );
 
+    const visibleSubmission = req.user.role === 'teacher'
+      ? sanitizeSubmissionForTeacher(submission)
+      : submission;
+
     res.json({
       success: true,
-      submission
+      submission: visibleSubmission
     });
   } catch (error) {
     console.error('Get submission error:', error);
@@ -1846,6 +1932,7 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
       assignedAt: item.assignedAt,
       roundId: item.roundId?._id || item.roundId || null,
       roundStatus: item.roundId?.status || resolvedRound?.status || null,
+      roundStage: item.roundId?.stage || resolvedRound?.stage || 'standard',
       isHistorical: assignmentResult.isHistorical === true
     });
     
@@ -1856,6 +1943,7 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
       roundContext: resolvedRound ? {
         roundId: resolvedRound._id || resolvedRound,
         roundStatus: resolvedRound.status || null,
+        roundStage: resolvedRound.stage || 'standard',
         isActionable: isRoundActionable(resolvedRound)
       } : null,
       message: assignment
@@ -1922,7 +2010,8 @@ router.post(
       const roundResolution = await resolveSubmissionRoundContext(submission, {
         explicitRoundId: req.body.roundId || req.query.roundId || null,
         includeHistorical: false,
-        allowFallbackByYearLevel: true
+        allowFallbackByYearLevel: true,
+        includeFaceToFace: Boolean(req.body.roundId || req.query.roundId)
       });
 
       if (!roundResolution.round) {
@@ -1965,7 +2054,8 @@ router.post(
           judgeId: result.assignment.judgeId,
           assignedAt: result.assignment.assignedAt,
           roundId: result.assignment.roundId,
-          roundStatus: roundResolution.round.status
+          roundStatus: roundResolution.round.status,
+          roundStage: roundResolution.round.stage || 'standard'
         },
         message: result.message
       });
