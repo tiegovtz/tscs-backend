@@ -3,8 +3,9 @@ const mongoose = require('mongoose');
 /**
  * SubmissionAssignment Model
  * 
- * Tracks 1-to-1 judge-submission assignments for Council and Regional levels.
- * At National level, multiple judges can evaluate the same submission (no assignment needed).
+ * Tracks judge-submission assignments for all levels.
+ * Council/Regional keep one current judge per submission per round.
+ * National allows multiple judges to evaluate the same submission.
  */
 const submissionAssignmentSchema = new mongoose.Schema({
   roundId: {
@@ -27,12 +28,14 @@ const submissionAssignmentSchema = new mongoose.Schema({
   },
   level: {
     type: String,
-    enum: ['Council', 'Regional'],
+    enum: ['Council', 'Regional', 'National'],
     required: true
   },
   region: {
     type: String,
-    required: true,
+    required: function requireRegionForScopedAssignment() {
+      return this.level !== 'National';
+    },
     trim: true
   },
   council: {
@@ -54,13 +57,18 @@ const submissionAssignmentSchema = new mongoose.Schema({
 
 // Compound indexes for efficient queries
 submissionAssignmentSchema.index({ roundId: 1, judgeId: 1, level: 1 });
-submissionAssignmentSchema.index({ roundId: 1, submissionId: 1 }, { unique: true });
-submissionAssignmentSchema.index({ roundId: 1, submissionId: 1, judgeId: 1 });
+submissionAssignmentSchema.index({ roundId: 1, submissionId: 1 });
+submissionAssignmentSchema.index({ roundId: 1, submissionId: 1, judgeId: 1 }, { unique: true });
+submissionAssignmentSchema.index(
+  { roundId: 1, submissionId: 1, level: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { level: { $in: ['Council', 'Regional'] } }
+  }
+);
 submissionAssignmentSchema.index({ roundId: 1, level: 1, region: 1, council: 1 });
 
 module.exports = mongoose.model('SubmissionAssignment', submissionAssignmentSchema);
-
-
 
 
 

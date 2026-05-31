@@ -148,53 +148,21 @@ router.get('/', cacheMiddleware(30), async (req, res) => {
       });
     }
 
-    // Council/Regional judges: show only submissions where the latest assignment points to this judge.
-    if (req.user.role === 'judge' && (req.user.assignedLevel === 'Council' || req.user.assignedLevel === 'Regional')) {
-      const latestAssignmentsForJudge = await SubmissionAssignment.aggregate([
-        {
-          $match: {
-            level: req.user.assignedLevel
-          }
-        },
-        {
-          $sort: {
-            assignedAt: -1,
-            createdAt: -1,
-            _id: -1
-          }
-        },
-        {
-          $group: {
-            _id: '$submissionId',
-            latest: { $first: '$$ROOT' }
-          }
-        },
-        {
-          $replaceRoot: {
-            newRoot: '$latest'
-          }
-        },
-        {
-          $match: {
-            judgeId: new mongoose.Types.ObjectId(req.user._id)
-          }
-        },
-        {
-          $project: {
-            _id: 0,
-            submissionId: 1,
-            roundId: 1,
-            assignedAt: 1,
-            createdAt: 1
-          }
-        }
-      ]);
+    // Assignment-based judges only see submissions assigned to them for their level.
+    if (req.user.role === 'judge' && ['Council', 'Regional', 'National'].includes(req.user.assignedLevel)) {
+      const assignmentsForJudge = await SubmissionAssignment.find({
+        level: req.user.assignedLevel,
+        judgeId: req.user._id
+      })
+        .sort({ assignedAt: -1, createdAt: -1, _id: -1 })
+        .select('submissionId roundId assignedAt createdAt')
+        .lean();
 
-      const assignmentPairs = latestAssignmentsForJudge.map((assignment) => ({
+      const assignmentPairs = assignmentsForJudge.map((assignment) => ({
         _id: assignment.submissionId
       }));
       judgeAssignmentMap = new Map(
-        latestAssignmentsForJudge.map((assignment) => [
+        assignmentsForJudge.map((assignment) => [
           String(assignment.submissionId),
           {
             roundId: assignment.roundId,
@@ -458,10 +426,10 @@ router.get('/unassigned', authorize('admin', 'superadmin', 'stakeholder'), cache
         }
       }
 
-      if (round.level !== 'Council' && round.level !== 'Regional') {
+      if (!['Council', 'Regional', 'National'].includes(round.level)) {
         return res.status(400).json({
           success: false,
-          message: 'Unassigned submissions are only available for Council and Regional rounds'
+          message: 'Unassigned submissions are only available for Council, Regional, and National rounds'
         });
       }
 
@@ -1853,15 +1821,6 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
       });
     }
 
-    // Only Council and Regional levels have assignments
-    if (submission.level === 'National') {
-      return res.json({
-        success: true,
-        assignment: null,
-        message: 'National level does not require assignment'
-      });
-    }
-
     const includeHistorical = parseBooleanParam(req.query.includeHistorical);
     const assignmentResult = await getAssignedJudge(req.params.id, {
       roundId: req.query.roundId || null,
@@ -1877,27 +1836,32 @@ router.get('/:id/assigned-judge', authorize('admin', 'superadmin'), async (req, 
     }
 
     const assignment = assignmentResult.assignment;
+    const assignments = assignmentResult.assignments || (assignment ? [assignment] : []);
     const resolvedRound = assignmentResult.round || assignment?.roundId || null;
+    const serializeAssignment = (item) => ({
+      assignmentId: item._id,
+      judgeId: item.judgeId._id,
+      judgeName: item.judgeId.name,
+      judgeEmail: item.judgeId.email,
+      assignedAt: item.assignedAt,
+      roundId: item.roundId?._id || item.roundId || null,
+      roundStatus: item.roundId?.status || resolvedRound?.status || null,
+      isHistorical: assignmentResult.isHistorical === true
+    });
     
     res.json({
       success: true,
-      assignment: assignment ? {
-        assignmentId: assignment._id,
-        judgeId: assignment.judgeId._id,
-        judgeName: assignment.judgeId.name,
-        judgeEmail: assignment.judgeId.email,
-        assignedAt: assignment.assignedAt,
-        roundId: assignment.roundId?._id || assignment.roundId || null,
-        roundStatus: assignment.roundId?.status || resolvedRound?.status || null,
-        isHistorical: assignmentResult.isHistorical === true
-      } : null,
+      assignment: assignment ? serializeAssignment(assignment) : null,
+      assignments: assignments.map(serializeAssignment),
       roundContext: resolvedRound ? {
         roundId: resolvedRound._id || resolvedRound,
         roundStatus: resolvedRound.status || null,
         isActionable: isRoundActionable(resolvedRound)
       } : null,
       message: assignment
-        ? assignmentResult.isHistorical ? 'Historical judge assignment found' : 'Judge assigned'
+        ? assignmentResult.isHistorical
+          ? 'Historical judge assignment found'
+          : `${assignments.length} judge assignment(s) found`
         : 'No judge assigned for the current round context'
     });
   } catch (error) {
