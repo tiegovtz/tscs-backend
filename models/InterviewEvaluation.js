@@ -16,20 +16,17 @@ const interviewEvaluationSchema = new mongoose.Schema({
   roundId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'CompetitionRound',
-    required: true,
-    index: true
+    required: true
   },
   submissionId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Submission',
-    required: true,
-    index: true
+    required: true
   },
   judgeId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
-    index: true
+    required: true
   },
   score: {
     type: Number,
