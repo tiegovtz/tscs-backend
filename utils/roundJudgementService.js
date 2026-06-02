@@ -892,7 +892,7 @@ const getNationalTopEntriesByResultOne = (entries = [], limit = NATIONAL_FINAL_S
   const entriesByAreaOfFocus = new Map();
   for (const entry of entries) {
     if (!entry || ['disqualified', 'eliminated'].includes(String(entry.status || '').toLowerCase())) continue;
-    if (Math.max(0, Math.floor(normalizeNumeric(entry.totalEvaluations))) <= 0) continue;
+    if (Math.max(0, Math.floor(normalizeNumeric(entry.totalEvaluations))) < NATIONAL_AREA_PANEL_SIZE) continue;
     const areaKey = normalizeAreaOfFocus(entry.areaOfFocus || '') || 'national';
     if (!entriesByAreaOfFocus.has(areaKey)) entriesByAreaOfFocus.set(areaKey, []);
     entriesByAreaOfFocus.get(areaKey).push(entry);
