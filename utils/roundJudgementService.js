@@ -766,10 +766,10 @@ const resolveTeacherId = (submission) => {
   return teacher;
 };
 
-const getRubricMaxScoresBySubmission = async (submissions = []) => {
+const getRubricMaxScoresBySubmission = async (submissions = [], fallbackYear = null) => {
   const years = [...new Set(
     submissions
-      .map((submission) => Number(submission?.year))
+      .map((submission) => Number(submission?.year || fallbackYear))
       .filter((year) => Number.isFinite(year))
   )];
   const competitions = years.length > 0
@@ -781,7 +781,7 @@ const getRubricMaxScoresBySubmission = async (submissions = []) => {
   for (const submission of submissions) {
     const submissionId = String(submission?._id || '');
     if (!submissionId) continue;
-    const competition = competitionByYear.get(Number(submission.year));
+    const competition = competitionByYear.get(Number(submission.year || fallbackYear));
     const rawCriteria = getEvaluationCriteriaFromCompetition(
       competition,
       submission.category,
@@ -797,27 +797,36 @@ const getRubricMaxScoresBySubmission = async (submissions = []) => {
   return maxScoreBySubmission;
 };
 
-const getInterviewAverageMapForSubmissionIds = async ({ roundId, submissionIds }) => {
+const getInterviewAverageMapForSubmissionIds = async ({ submissionIds, panelJudgeIdsBySubmission = null }) => {
   const submissionObjectIds = toObjectIdList(submissionIds);
   if (submissionObjectIds.length === 0) return new Map();
 
   const interviews = await InterviewEvaluation.find({
-    roundId,
     level: 'National',
     submissionId: { $in: submissionObjectIds }
   })
-    .select('submissionId judgeId score')
+    .select('submissionId judgeId score submittedAt createdAt')
+    .sort({ submittedAt: -1, createdAt: -1, _id: -1 })
     .lean();
 
   const grouped = new Map();
+  const seenSubmissionJudge = new Set();
   for (const interview of interviews) {
     const submissionId = String(interview.submissionId);
+    const judgeId = interview.judgeId ? String(interview.judgeId) : null;
+    if (!judgeId) continue;
+    const panelJudgeIds = panelJudgeIdsBySubmission?.get(submissionId);
+    if (panelJudgeIds && !panelJudgeIds.has(judgeId)) continue;
+    const submissionJudgeKey = `${submissionId}::${judgeId}`;
+    if (seenSubmissionJudge.has(submissionJudgeKey)) continue;
+    seenSubmissionJudge.add(submissionJudgeKey);
+
     if (!grouped.has(submissionId)) {
       grouped.set(submissionId, { totalScore: 0, judgeIds: new Set() });
     }
     const current = grouped.get(submissionId);
     current.totalScore += normalizeNumeric(interview.score);
-    if (interview.judgeId) current.judgeIds.add(String(interview.judgeId));
+    current.judgeIds.add(judgeId);
   }
 
   const averageMap = new Map();
@@ -836,11 +845,16 @@ const getInterviewAverageMapForSubmissionIds = async ({ roundId, submissionIds }
 const buildNationalFinalScoreMap = async ({ round, submissions, evaluationMap }) => {
   if (!round || round.level !== 'National') return new Map();
 
+  const submissionIds = submissions.map((submission) => submission?._id).filter(Boolean);
+  const panelJudgeIdsBySubmission = await getNationalPanelJudgeIdsBySubmission({
+    roundId: round._id,
+    submissionIds
+  });
   const [rubricMaxBySubmission, interviewMap] = await Promise.all([
-    getRubricMaxScoresBySubmission(submissions),
+    getRubricMaxScoresBySubmission(submissions, round.year),
     getInterviewAverageMapForSubmissionIds({
-      roundId: round._id,
-      submissionIds: submissions.map((submission) => submission?._id).filter(Boolean)
+      submissionIds,
+      panelJudgeIdsBySubmission
     })
   ]);
 
@@ -872,6 +886,71 @@ const buildNationalFinalScoreMap = async ({ round, submissions, evaluationMap })
   }
 
   return finalScoreMap;
+};
+
+const getNationalTopEntriesByResultOne = (entries = [], limit = NATIONAL_FINAL_SELECTION_COUNT) => {
+  const entriesByAreaOfFocus = new Map();
+  for (const entry of entries) {
+    if (!entry || ['disqualified', 'eliminated'].includes(String(entry.status || '').toLowerCase())) continue;
+    if (Math.max(0, Math.floor(normalizeNumeric(entry.totalEvaluations))) <= 0) continue;
+    const areaKey = normalizeAreaOfFocus(entry.areaOfFocus || '') || 'national';
+    if (!entriesByAreaOfFocus.has(areaKey)) entriesByAreaOfFocus.set(areaKey, []);
+    entriesByAreaOfFocus.get(areaKey).push(entry);
+  }
+
+  const selectedEntries = [];
+  for (const areaEntries of entriesByAreaOfFocus.values()) {
+    selectedEntries.push(
+      ...areaEntries
+        .sort((a, b) => {
+          const aScore = normalizeNumeric(a.videoWeightedScore ?? a.totalScore ?? a.averageScore);
+          const bScore = normalizeNumeric(b.videoWeightedScore ?? b.totalScore ?? b.averageScore);
+          if (bScore !== aScore) return bScore - aScore;
+          const aCreatedAt = a.tieBreakCreatedAt ? new Date(a.tieBreakCreatedAt).getTime() : Number.MAX_SAFE_INTEGER;
+          const bCreatedAt = b.tieBreakCreatedAt ? new Date(b.tieBreakCreatedAt).getTime() : Number.MAX_SAFE_INTEGER;
+          if (aCreatedAt !== bCreatedAt) return aCreatedAt - bCreatedAt;
+          return String(a.submissionId || '').localeCompare(String(b.submissionId || ''));
+        })
+        .slice(0, limit)
+    );
+  }
+
+  return selectedEntries;
+};
+
+const getNationalInterviewEligibleSubmissionIds = async ({ roundId, limit = NATIONAL_FINAL_SELECTION_COUNT }) => {
+  const round = await CompetitionRound.findById(roundId);
+  if (!round || round.level !== 'National') return new Set();
+
+  const submissions = (await getAreaSubmissionsForLevel(round, 'national', { includeEvaluatedWithoutVideo: true }))
+    .map((submission) => (submission && typeof submission.toObject === 'function' ? submission.toObject() : submission));
+  const submissionIds = submissions.map((submission) => submission._id);
+  const panelResult = await getNationalPanelEvaluationMapForSubmissionIds({
+    roundId: round._id,
+    submissionIds
+  });
+  const resultOneMap = await buildNationalFinalScoreMap({
+    round,
+    submissions,
+    evaluationMap: panelResult.evaluationMap
+  });
+
+  const candidateEntries = submissions.map((submission) => {
+      const submissionId = String(submission._id);
+      const scoreData = panelResult.evaluationMap.get(submissionId) || {};
+      const resultOne = resultOneMap.get(submissionId) || {};
+      return {
+        submissionId,
+        areaOfFocus: submission.areaOfFocus || '',
+        totalEvaluations: Math.max(0, Math.floor(normalizeNumeric(scoreData.totalEvaluations))),
+        status: submission.status || 'submitted',
+        videoWeightedScore: normalizeNumeric(resultOne.videoWeightedScore),
+        tieBreakCreatedAt: submission.createdAt || null
+      };
+    })
+    .filter((entry) => entry.totalEvaluations > 0);
+
+  return new Set(getNationalTopEntriesByResultOne(candidateEntries, limit).map((entry) => entry.submissionId));
 };
 
 const resolveLeaderboardScoreFields = (scoreData = {}) => {
@@ -1120,7 +1199,10 @@ const syncLeaderboardScoresFromEvaluations = async (
     return leaderboard;
   }
 
-  const rankedEntries = rankEntriesDeterministically(updatedEntries);
+  const entriesForRanking = leaderboard.level === 'National'
+    ? getNationalTopEntriesByResultOne(updatedEntries, NATIONAL_FINAL_SELECTION_COUNT)
+    : updatedEntries;
+  const rankedEntries = rankEntriesDeterministically(entriesForRanking);
   const sanitizedEntries = rankedEntries.filter(
     (entry) => Boolean(entry?.submissionId) && Boolean(entry?.teacherId)
   );
@@ -1247,7 +1329,7 @@ const getAreaSubmissionsForLevel = async (round, areaId, options = {}) => {
     ...areaQuery
   })
     .select(
-      '_id teacherId teacherName school region council category class subject areaOfFocus status disqualified createdAt videoFileUrl videoLink preferredLink'
+      '_id teacherId teacherName school region council category class subject areaOfFocus status disqualified createdAt year videoFileUrl videoLink preferredLink'
     );
 
   return submissions.filter((submission) => {
@@ -2109,7 +2191,10 @@ const rebuildAreaLeaderboard = async (roundId, areaId, options = {}) => {
     return entry;
   });
 
-  const rankedEntries = rankEntriesDeterministically(entries);
+  const leaderboardEntries = round.level === 'National'
+    ? getNationalTopEntriesByResultOne(entries, NATIONAL_FINAL_SELECTION_COUNT)
+    : entries;
+  const rankedEntries = rankEntriesDeterministically(leaderboardEntries);
   const quotaInfo = await resolveQuotaForArea({ round, areaId, areaType });
   const chunks = await getChunksForArea(round._id, areaType, areaId);
 
@@ -3719,6 +3804,7 @@ module.exports = {
   rebuildAreaLeaderboard,
   updateAreaStateByCompletion,
   checkAreaJudgeCompletion,
+  getNationalInterviewEligibleSubmissionIds,
   addSubmissionToActiveRoundSnapshot,
   updateRoundSubmissionsFromScope,
   discoverMissingLeaderboardAreas,

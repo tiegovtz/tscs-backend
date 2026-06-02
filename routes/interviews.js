@@ -2,14 +2,14 @@ const express = require('express');
 const InterviewEvaluation = require('../models/InterviewEvaluation');
 const Evaluation = require('../models/Evaluation');
 const Submission = require('../models/Submission');
+const SubmissionAssignment = require('../models/SubmissionAssignment');
 const { protect, authorize } = require('../middleware/auth');
 const { invalidateCacheOnChange } = require('../middleware/cache');
 const { logger } = require('../utils/logger');
-const { resolveJudgeEvaluationAuthorization } = require('../utils/judgeAssignment');
 const {
-  getRoundBySubmissionForEvaluation,
   refreshSubmissionAndAreaLeaderboard,
-  getAreaIdFromSubmission
+  getAreaIdFromSubmission,
+  getNationalInterviewEligibleSubmissionIds
 } = require('../utils/roundJudgementService');
 
 const router = express.Router();
@@ -76,6 +76,56 @@ router.get('/submission/:submissionId', async (req, res) => {
   }
 });
 
+router.get('/eligible', authorize('judge'), async (req, res) => {
+  try {
+    const evaluations = await Evaluation.find({
+      judgeId: req.user._id,
+      level: 'National'
+    })
+      .select('submissionId roundId submittedAt')
+      .sort({ submittedAt: -1, createdAt: -1, _id: -1 })
+      .lean();
+
+    const latestEvaluationBySubmission = new Map();
+    for (const evaluation of evaluations) {
+      const submissionId = String(evaluation.submissionId || '');
+      if (!submissionId || latestEvaluationBySubmission.has(submissionId)) continue;
+      latestEvaluationBySubmission.set(submissionId, evaluation);
+    }
+
+    const eligibleSubmissionIds = new Set();
+    const roundIds = [
+      ...new Set(
+        [...latestEvaluationBySubmission.values()]
+          .map((evaluation) => evaluation.roundId)
+          .filter(Boolean)
+          .map((roundId) => String(roundId))
+      )
+    ];
+
+    for (const roundId of roundIds) {
+      const roundEligibleIds = await getNationalInterviewEligibleSubmissionIds({ roundId });
+      for (const submissionId of roundEligibleIds) {
+        if (latestEvaluationBySubmission.has(submissionId)) {
+          eligibleSubmissionIds.add(submissionId);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      count: eligibleSubmissionIds.size,
+      submissionIds: [...eligibleSubmissionIds]
+    });
+  } catch (error) {
+    console.error('Get eligible interview submissions error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error'
+    });
+  }
+});
+
 router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leaderboard*', 'cache:/api/submissions*', 'cache:/api/interviews*']), async (req, res) => {
   try {
     const { submissionId, score, comments, roundId: explicitRoundId } = req.body;
@@ -110,49 +160,19 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       });
     }
 
-    const round = await getRoundBySubmissionForEvaluation(submission, {
-      explicitRoundId: explicitRoundId || req.query?.roundId || null
-    });
-    if (!round || round.level !== 'National') {
-      return res.status(403).json({
-        success: false,
-        message: 'No eligible National round found for this submission'
-      });
-    }
-
-    if (round.status === 'archived' || round.status === 'closed') {
-      return res.status(403).json({
-        success: false,
-        message: 'Interview marks cannot be submitted for a closed or archived round'
-      });
-    }
-
-    const authorization = await resolveJudgeEvaluationAuthorization(
+    const baseEvaluationQuery = {
       submissionId,
-      req.user._id,
-      round._id,
-      { allowVisibleAssignmentFallback: false }
-    );
-
-    if (!authorization.success) {
-      return res.status(500).json({
-        success: false,
-        message: authorization.error || 'Failed to verify judge assignment authorization'
-      });
+      judgeId: req.user._id,
+      level: 'National'
+    };
+    const resolvedRoundId = explicitRoundId || req.query?.roundId || null;
+    if (resolvedRoundId) {
+      baseEvaluationQuery.roundId = resolvedRoundId;
     }
 
-    if (!authorization.authorized) {
-      return res.status(403).json({
-        success: false,
-        message: 'You are not assigned to interview this submission for the active round.'
-      });
-    }
-
-    const baseEvaluation = await Evaluation.findOne({
-      roundId: round._id,
-      submissionId,
-      judgeId: req.user._id
-    }).select('_id');
+    const baseEvaluation = await Evaluation.findOne(baseEvaluationQuery)
+      .select('_id roundId year level submittedAt')
+      .sort({ submittedAt: -1, createdAt: -1, _id: -1 });
 
     if (!baseEvaluation) {
       return res.status(400).json({
@@ -161,16 +181,45 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       });
     }
 
+    if (!baseEvaluation.roundId) {
+      return res.status(400).json({
+        success: false,
+        message: 'The completed National evaluation is missing its round reference.'
+      });
+    }
+
+    const eligibleSubmissionIds = await getNationalInterviewEligibleSubmissionIds({
+      roundId: baseEvaluation.roundId
+    });
+    if (!eligibleSubmissionIds.has(String(submissionId))) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the top 5 submissions in each area of competition after result 1 are eligible for interview marks.'
+      });
+    }
+
+    const panelAssignment = await SubmissionAssignment.findOne({
+      roundId: baseEvaluation.roundId,
+      submissionId,
+      judgeId: req.user._id,
+      level: 'National'
+    }).select('_id');
+    if (!panelAssignment) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only assigned National panel judges can enter interview marks for this submission.'
+      });
+    }
+
     const interview = await InterviewEvaluation.findOneAndUpdate(
       {
-        roundId: round._id,
         submissionId,
         judgeId: req.user._id
       },
       {
         year: Number(submission.year),
         level: 'National',
-        roundId: round._id,
+        roundId: baseEvaluation.roundId,
         submissionId,
         judgeId: req.user._id,
         score: numericScore,
@@ -182,7 +231,7 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       .populate('submissionId', 'teacherName category subject level region council areaOfFocus')
       .populate('roundId', 'year level status stage');
 
-    await refreshSubmissionAndAreaLeaderboard({ submissionId, roundId: round._id });
+    await refreshSubmissionAndAreaLeaderboard({ submissionId, roundId: baseEvaluation.roundId });
 
     await logger.logUserActivity(
       'Judge submitted interview marks',
@@ -190,7 +239,7 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       req,
       {
         interviewId: interview._id.toString(),
-        roundId: round._id.toString(),
+        roundId: baseEvaluation.roundId.toString(),
         submissionId: submissionId.toString(),
         areaId: getAreaIdFromSubmission(submission),
         score: numericScore
@@ -202,10 +251,9 @@ router.post('/', authorize('judge'), invalidateCacheOnChange(['cache:/api/leader
       success: true,
       interview,
       round: {
-        id: round._id,
-        year: round.year,
-        level: round.level,
-        status: round.status
+        id: baseEvaluation.roundId,
+        year: baseEvaluation.year || submission.year,
+        level: 'National'
       }
     });
   } catch (error) {
