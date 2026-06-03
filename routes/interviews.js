@@ -112,10 +112,24 @@ router.get('/eligible', authorize('judge'), async (req, res) => {
       }
     }
 
+    const eligibleSubmissions = eligibleSubmissionIds.size > 0
+      ? await Submission.find({ _id: { $in: [...eligibleSubmissionIds] } })
+        .select('_id teacherId teacherName school category class subject areaOfFocus level region council year status averageScore videoLink preferredLink videoFileName videoFileUrl lessonPlanFileName lessonPlanFileUrl createdAt')
+        .populate('teacherId', 'name email')
+        .lean()
+      : [];
+
+    const eligibleOrder = new Map([...eligibleSubmissionIds].map((id, index) => [id, index]));
+    eligibleSubmissions.sort((a, b) => (
+      (eligibleOrder.get(String(a._id)) ?? Number.MAX_SAFE_INTEGER)
+      - (eligibleOrder.get(String(b._id)) ?? Number.MAX_SAFE_INTEGER)
+    ));
+
     res.json({
       success: true,
       count: eligibleSubmissionIds.size,
-      submissionIds: [...eligibleSubmissionIds]
+      submissionIds: [...eligibleSubmissionIds],
+      submissions: eligibleSubmissions
     });
   } catch (error) {
     console.error('Get eligible interview submissions error:', error);
