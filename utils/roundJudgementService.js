@@ -7,6 +7,7 @@ const Quota = require('../models/Quota');
 const Submission = require('../models/Submission');
 const Evaluation = require('../models/Evaluation');
 const InterviewEvaluation = require('../models/InterviewEvaluation');
+const InterviewAssignment = require('../models/InterviewAssignment');
 const User = require('../models/User');
 const SubmissionAssignment = require('../models/SubmissionAssignment');
 const AreaLeaderboard = require('../models/AreaLeaderboard');
@@ -662,6 +663,40 @@ const getNationalPanelJudgeIdsBySubmission = async ({ roundId, submissionIds }) 
   );
 };
 
+const getNationalInterviewAssignmentJudgeIdsBySubmission = async ({ roundId, submissionIds }) => {
+  const submissionObjectIds = toObjectIdList(submissionIds);
+  if (submissionObjectIds.length === 0) return new Map();
+
+  const assignments = await InterviewAssignment.find({
+    roundId,
+    submissionId: { $in: submissionObjectIds }
+  })
+    .select('submissionId judgeId assignedAt createdAt')
+    .sort({ assignedAt: 1, createdAt: 1, _id: 1 })
+    .lean();
+
+  const judgeIdsBySubmission = new Map();
+  for (const assignment of assignments) {
+    const submissionId = String(assignment.submissionId);
+    const judgeId = assignment.judgeId ? String(assignment.judgeId) : null;
+    if (!judgeId) continue;
+    if (!judgeIdsBySubmission.has(submissionId)) {
+      judgeIdsBySubmission.set(submissionId, []);
+    }
+    const judgeIds = judgeIdsBySubmission.get(submissionId);
+    if (judgeIds.includes(judgeId)) continue;
+    if (judgeIds.length >= NATIONAL_AREA_PANEL_SIZE) continue;
+    judgeIds.push(judgeId);
+  }
+
+  return new Map(
+    [...judgeIdsBySubmission.entries()].map(([submissionId, judgeIds]) => [
+      submissionId,
+      new Set(judgeIds)
+    ])
+  );
+};
+
 const getNationalPanelEvaluationMapForSubmissionIds = async ({
   roundId,
   submissionIds,
@@ -797,14 +832,21 @@ const getRubricMaxScoresBySubmission = async (submissions = [], fallbackYear = n
   return maxScoreBySubmission;
 };
 
-const getInterviewAverageMapForSubmissionIds = async ({ submissionIds, panelJudgeIdsBySubmission = null }) => {
+const getInterviewAverageMapForSubmissionIds = async ({
+  submissionIds,
+  roundId = null,
+  panelJudgeIdsBySubmission = null
+}) => {
   const submissionObjectIds = toObjectIdList(submissionIds);
   if (submissionObjectIds.length === 0) return new Map();
 
-  const interviews = await InterviewEvaluation.find({
+  const query = {
     level: 'National',
     submissionId: { $in: submissionObjectIds }
-  })
+  };
+  if (roundId) query.roundId = roundId;
+
+  const interviews = await InterviewEvaluation.find(query)
     .select('submissionId judgeId score submittedAt createdAt')
     .sort({ submittedAt: -1, createdAt: -1, _id: -1 })
     .lean();
@@ -815,8 +857,10 @@ const getInterviewAverageMapForSubmissionIds = async ({ submissionIds, panelJudg
     const submissionId = String(interview.submissionId);
     const judgeId = interview.judgeId ? String(interview.judgeId) : null;
     if (!judgeId) continue;
-    const panelJudgeIds = panelJudgeIdsBySubmission?.get(submissionId);
-    if (panelJudgeIds && !panelJudgeIds.has(judgeId)) continue;
+    if (panelJudgeIdsBySubmission) {
+      const panelJudgeIds = panelJudgeIdsBySubmission.get(submissionId);
+      if (!panelJudgeIds || !panelJudgeIds.has(judgeId)) continue;
+    }
     const submissionJudgeKey = `${submissionId}::${judgeId}`;
     if (seenSubmissionJudge.has(submissionJudgeKey)) continue;
     seenSubmissionJudge.add(submissionJudgeKey);
@@ -846,7 +890,7 @@ const buildNationalFinalScoreMap = async ({ round, submissions, evaluationMap })
   if (!round || round.level !== 'National') return new Map();
 
   const submissionIds = submissions.map((submission) => submission?._id).filter(Boolean);
-  const panelJudgeIdsBySubmission = await getNationalPanelJudgeIdsBySubmission({
+  const interviewJudgeIdsBySubmission = await getNationalInterviewAssignmentJudgeIdsBySubmission({
     roundId: round._id,
     submissionIds
   });
@@ -854,7 +898,8 @@ const buildNationalFinalScoreMap = async ({ round, submissions, evaluationMap })
     getRubricMaxScoresBySubmission(submissions, round.year),
     getInterviewAverageMapForSubmissionIds({
       submissionIds,
-      panelJudgeIdsBySubmission
+      roundId: round._id,
+      panelJudgeIdsBySubmission: interviewJudgeIdsBySubmission
     })
   ]);
 
@@ -3805,6 +3850,7 @@ module.exports = {
   updateAreaStateByCompletion,
   checkAreaJudgeCompletion,
   getNationalInterviewEligibleSubmissionIds,
+  getNationalInterviewAssignmentJudgeIdsBySubmission,
   addSubmissionToActiveRoundSnapshot,
   updateRoundSubmissionsFromScope,
   discoverMissingLeaderboardAreas,
