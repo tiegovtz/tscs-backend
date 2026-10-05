@@ -50,6 +50,14 @@ const protect = async (req, res, next) => {
         });
       }
 
+      if ((req.user.role === 'admin' || req.user.role === 'superadmin') && decoded.mfa !== true) {
+        return res.status(401).json({
+          success: false,
+          code: 'MFA_REQUIRED',
+          message: 'Multi-factor authentication is required for this account'
+        });
+      }
+
       next();
     } catch (error) {
       return res.status(401).json({
@@ -89,4 +97,3 @@ const authorizeNationalAdminOrSuperadmin = (req, res, next) => {
 };
 
 module.exports = { protect, authorize, authorizeNationalAdminOrSuperadmin };
-

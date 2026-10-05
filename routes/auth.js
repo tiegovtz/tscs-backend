@@ -5,9 +5,11 @@ const User = require('../models/User');
 const PasswordReset = require('../models/PasswordReset');
 const { protect } = require('../middleware/auth');
 const OTPService = require('../services/otpService');
+const MfaService = require('../services/mfaService');
 const emailService = require('../services/emailService');
 const notificationService = require('../services/notificationService');
 const { failedLoginLockout, recordFailedAttempt, clearFailedAttempts } = require('../services/failedLoginTracker');
+const { validatePassword } = require('../utils/passwordPolicy');
 
 // Safely import logger - if it fails, app should still work
 let logger = null;
@@ -31,11 +33,45 @@ try {
 const router = express.Router();
 
 // Generate JWT Token
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
+const generateToken = (id, { mfa = false } = {}) => {
+  return jwt.sign({
+    id,
+    mfa,
+    amr: mfa ? ['pwd', 'email_otp'] : ['pwd'],
+    authTime: Math.floor(Date.now() / 1000)
+  }, process.env.JWT_SECRET, {
     expiresIn: '30d'
   });
 };
+
+const serializeAuthUser = (user) => ({
+  id: user._id,
+  username: user.username,
+  name: user.name,
+  email: user.email,
+  phone: user.phone,
+  gender: user.gender,
+  role: user.role,
+  ...(user.role === 'teacher' && {
+    school: user.school,
+    region: user.region,
+    council: user.council,
+    chequeNumber: user.chequeNumber,
+    subject: user.subject
+  }),
+  ...(user.role === 'judge' && {
+    assignedLevel: user.assignedLevel,
+    assignedRegion: user.assignedRegion,
+    assignedCouncil: user.assignedCouncil,
+    specialization: user.specialization,
+    experience: user.experience
+  }),
+  ...(user.role === 'admin' && {
+    adminLevel: user.adminLevel,
+    adminRegion: user.adminRegion,
+    adminCouncil: user.adminCouncil
+  })
+});
 
 // @route   POST /api/auth/login
 // @desc    Login user
@@ -113,12 +149,55 @@ router.post('/login', failedLoginLockout, async (req, res) => {
       });
     }
 
+    if (user.role === 'admin' || user.role === 'superadmin') {
+      const mfaResult = await MfaService.createChallenge(user, {
+        ip: req.ip,
+        userAgent: req.get('user-agent')
+      });
+
+      if (!mfaResult.success) {
+        if (logger) {
+          logger.logSecurity(
+            'Privileged login MFA delivery failed',
+            user._id,
+            req,
+            { role: user.role },
+            'error'
+          ).catch(() => {});
+        }
+        return res.status(503).json({
+          success: false,
+          message: 'Unable to send the authentication code. Please try again later.'
+        });
+      }
+
+      await clearFailedAttempts(req.ip);
+      if (logger) {
+        logger.logSecurity(
+          'Privileged login MFA challenge sent',
+          user._id,
+          req,
+          { role: user.role },
+          'info'
+        ).catch(() => {});
+      }
+
+      return res.json({
+        success: false,
+        requiresMFA: true,
+        challengeId: mfaResult.challengeId,
+        maskedEmail: mfaResult.maskedEmail,
+        expiresInSeconds: mfaResult.expiresInSeconds,
+        message: 'Enter the authentication code sent to your registered email.'
+      });
+    }
+
     // Check if email is verified
-    // For admin/judge/stakeholder users registered by admin: send OTP if not verified
+    // For judge/stakeholder users registered by admin: send OTP if not verified
     // For teacher users (self-registered): require verification before login
     if (!user.emailVerified) {
-      // If user is admin, judge, or stakeholder (registered by admin), send OTP
-      if (user.role === 'admin' || user.role === 'judge' || user.role === 'stakeholder') {
+      // If user is judge or stakeholder (registered by admin), send OTP
+      if (user.role === 'judge' || user.role === 'stakeholder') {
         // Generate and send OTP for email verification
         const otpResult = await OTPService.createOTP(user.email);
 
@@ -138,7 +217,7 @@ router.post('/login', failedLoginLockout, async (req, res) => {
         // Log OTP sent for unverified admin/judge (non-blocking)
       if (logger) {
         logger.logSecurity(
-            'OTP sent for unverified admin/judge login',
+            'OTP sent for unverified judge/stakeholder login',
             user._id,
             req,
             { email: email.toLowerCase(), role: user.role },
@@ -191,34 +270,7 @@ router.post('/login', failedLoginLockout, async (req, res) => {
     res.json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        username: user.username,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        gender: user.gender,
-        role: user.role,
-        ...(user.role === 'teacher' && {
-          school: user.school,
-          region: user.region,
-          council: user.council,
-          chequeNumber: user.chequeNumber,
-          subject: user.subject
-        }),
-        ...(user.role === 'judge' && {
-          assignedLevel: user.assignedLevel,
-          assignedRegion: user.assignedRegion,
-          assignedCouncil: user.assignedCouncil,
-          specialization: user.specialization,
-          experience: user.experience
-        }),
-        ...(user.role === 'admin' && {
-          adminLevel: user.adminLevel,
-          adminRegion: user.adminRegion,
-          adminCouncil: user.adminCouncil
-        })
-      }
+      user: serializeAuthUser(user)
     });
     }
   } catch (error) {
@@ -258,6 +310,77 @@ const otpVerifyLimiter = rateLimit({
   legacyHeaders: false
 });
 
+// @route   POST /api/auth/verify-mfa
+// @desc    Complete admin/superadmin login using a challenge-bound email OTP
+// @access  Public (requires a valid MFA challenge)
+router.post('/verify-mfa', otpVerifyLimiter, async (req, res) => {
+  try {
+    const { challengeId, otp } = req.body;
+    if (typeof challengeId !== 'string' || typeof otp !== 'string') {
+      return res.status(400).json({
+        success: false,
+        message: 'MFA challenge and authentication code are required'
+      });
+    }
+
+    const result = await MfaService.verifyChallenge(challengeId, otp);
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error });
+    }
+
+    const token = generateToken(result.user._id, { mfa: true });
+    if (logger) {
+      logger.logSecurity(
+        'Privileged login MFA verified',
+        result.user._id,
+        req,
+        { role: result.user.role },
+        'success'
+      ).catch(() => {});
+    }
+
+    return res.json({
+      success: true,
+      token,
+      user: serializeAuthUser(result.user)
+    });
+  } catch (error) {
+    console.error('MFA verification error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error during MFA verification'
+    });
+  }
+});
+
+// @route   POST /api/auth/resend-mfa
+// @desc    Resend an admin/superadmin login MFA code
+// @access  Public (requires a valid MFA challenge)
+router.post('/resend-mfa', otpLimiter, async (req, res) => {
+  try {
+    const { challengeId } = req.body;
+    if (typeof challengeId !== 'string') {
+      return res.status(400).json({ success: false, message: 'MFA challenge is required' });
+    }
+
+    const result = await MfaService.resendChallenge(challengeId);
+    if (!result.success) {
+      return res.status(400).json({ success: false, message: result.error });
+    }
+
+    return res.json({
+      success: true,
+      challengeId: result.challengeId,
+      maskedEmail: result.maskedEmail,
+      expiresInSeconds: result.expiresInSeconds,
+      message: 'A new authentication code has been sent.'
+    });
+  } catch (error) {
+    console.error('MFA resend error:', error);
+    return res.status(500).json({ success: false, message: 'Server error while resending MFA code' });
+  }
+});
+
 // @route   POST /api/auth/register
 // @desc    Register new user (teacher) - sends OTP for email verification
 // @access  Public
@@ -282,6 +405,11 @@ router.post('/register', async (req, res) => {
         success: false,
         message: 'Please provide all required fields'
       });
+    }
+
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ success: false, message: passwordValidation.message });
     }
 
     // Check if user already exists
@@ -401,6 +529,17 @@ router.post('/verify-otp', otpVerifyLimiter, async (req, res) => {
       });
     }
 
+    const verificationUser = await User.findOne({
+      email: email.toLowerCase(),
+      isDeleted: { $ne: true }
+    }).select('role');
+    if (verificationUser && (verificationUser.role === 'admin' || verificationUser.role === 'superadmin')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Administrator accounts must use multi-factor authentication'
+      });
+    }
+
     // Verify OTP
     const verifyResult = await OTPService.verifyOTPAndUpdate(email, otp);
 
@@ -475,11 +614,11 @@ router.post('/verify-otp-and-login', otpVerifyLimiter, async (req, res) => {
       });
     }
 
-    // Only allow this for admin/judge/stakeholder users
-    if (user.role !== 'admin' && user.role !== 'judge' && user.role !== 'stakeholder') {
+    // Privileged users must use the challenge-bound MFA flow instead.
+    if (user.role !== 'judge' && user.role !== 'stakeholder') {
       return res.status(403).json({
         success: false,
-        message: 'This verification method is only for admin, judge, and stakeholder accounts'
+        message: 'This verification method is only for judge and stakeholder accounts'
       });
     }
 
@@ -772,12 +911,9 @@ router.post('/reset-password', async (req, res) => {
       });
     }
 
-    // Validate password strength
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password must be at least 8 characters long'
-      });
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ success: false, message: passwordValidation.message });
     }
 
     // Hash the reset token to find the record
@@ -946,33 +1082,9 @@ router.put('/change-password', protect, async (req, res) => {
       });
     }
 
-    // Validate new password strength
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: 'New password must be at least 8 characters long'
-      });
-    }
-
-    if (!/(?=.*[a-z])/.test(newPassword)) {
-      return res.status(400).json({
-        success: false,
-        message: 'New password must contain at least one lowercase letter'
-      });
-    }
-
-    if (!/(?=.*[A-Z])/.test(newPassword)) {
-      return res.status(400).json({
-        success: false,
-        message: 'New password must contain at least one uppercase letter'
-      });
-    }
-
-    if (!/(?=.*\d)/.test(newPassword)) {
-      return res.status(400).json({
-        success: false,
-        message: 'New password must contain at least one number'
-      });
+    const passwordValidation = validatePassword(newPassword);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ success: false, message: passwordValidation.message });
     }
 
     // Get current user with password

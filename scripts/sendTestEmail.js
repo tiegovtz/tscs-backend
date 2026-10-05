@@ -28,9 +28,9 @@ async function main() {
     process.exit(1);
   }
 
-  const subject = args.subject || 'TSCS Brevo Integration Test';
-  const textContent = args.text || 'Hello! This is a Brevo email test from TSCS.';
-  const htmlContent = args.html || `<p>Hello!</p><p>This is a <strong>Brevo email test</strong> from TSCS.</p><p>Message sent at ${new Date().toISOString()}.</p>`;
+  const subject = args.subject || 'TSCS Easymail Integration Test';
+  const textContent = args.text || 'Hello! This is an Easymail integration test from TSCS.';
+  const htmlContent = args.html || `<p>Hello!</p><p>This is an <strong>Easymail integration test</strong> from TSCS.</p><p>Message sent at ${new Date().toISOString()}.</p>`;
 
   const success = await emailService.sendEmail({
     to: args.to,

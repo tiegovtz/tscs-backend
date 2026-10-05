@@ -30,6 +30,10 @@ const initSocket = (server, corsOptions = {}) => {
         return next(new Error('User not found'));
       }
 
+      if ((user.role === 'admin' || user.role === 'superadmin') && decoded.mfa !== true) {
+        return next(new Error('Multi-factor authentication required'));
+      }
+
       socket.user = user;
       next();
     } catch (error) {

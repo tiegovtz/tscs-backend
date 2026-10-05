@@ -1,4 +1,5 @@
 const express = require('express');
+const { validatePassword } = require('../utils/passwordPolicy');
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Competition = require('../models/Competition');
@@ -426,12 +427,17 @@ router.post('/', async (req, res) => {
   try {
     const userData = { ...req.body };
 
-    // Validate required fields
-    if (!userData.password || userData.password.length < 6) {
-      return res.status(400).json({
+    if (userData.role === 'superadmin') {
+      return res.status(403).json({
         success: false,
-        message: 'Password is required and must be at least 6 characters'
+        message: 'Superadmin accounts cannot be created through the users API'
       });
+    }
+
+    // Validate required fields
+    const passwordValidation = validatePassword(userData.password);
+    if (!passwordValidation.valid) {
+      return res.status(400).json({ success: false, message: passwordValidation.message });
     }
 
     // Only superadmin can create admin users
@@ -578,6 +584,12 @@ router.put('/:id', async (req, res) => {
 
     // Prevent admin from changing user to admin (only superadmin can)
     const updateData = { ...req.body };
+    if (updateData.role === 'superadmin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Users cannot be promoted to superadmin through the users API'
+      });
+    }
     if (req.user.role === 'admin' && updateData.role === 'admin') {
       delete updateData.role;
     }

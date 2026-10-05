@@ -1,11 +1,21 @@
+const nodemailer = require('nodemailer');
 const https = require('https');
+const { randomUUID } = require('crypto');
 const EmailLog = require('../models/EmailLog');
 const smsService = require('./smsService');
+
+const escapeHTML = (value) => String(value || '').replace(/[&<>'"]/g, (character) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  "'": '&#39;',
+  '"': '&quot;'
+})[character]);
 
 /**
  * Email Service
  *
- * Handles email sending using Brevo Transactional Emails API
+ * Handles email sending through an SMTP server using Nodemailer
  * - Asynchronous, non-blocking email sending
  * - Comprehensive email logging
  * - Template support
@@ -13,14 +23,19 @@ const smsService = require('./smsService');
  */
 class EmailService {
   constructor() {
-    this.apiKey = null;
+    this.transporter = null;
+    this.easymailApiUrl = null;
+    this.easymailApiKey = null;
     this.senderEmail = null;
-    this.senderName = process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'TSCS';
+    this.senderName = process.env.SMTP_FROM_NAME || process.env.EMAIL_FROM_NAME || 'TSCS';
+    this.brevoApiKey = null;
+    this.brevoSenderEmail = null;
+    this.brevoSenderName = null;
     this.isInitialized = false;
   }
 
   /**
-   * Initialize Brevo API client
+   * Initialize Nodemailer SMTP transport
    */
   initialize() {
     if (this.isInitialized) return;
@@ -30,18 +45,44 @@ class EmailService {
     }
 
     try {
-      if (!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL) {
-        console.error('Brevo configuration incomplete: BREVO_API_KEY or BREVO_SENDER_EMAIL not set');
+      const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER;
+      const smtpPass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD;
+      const smtpHost = process.env.SMTP_HOST || (process.env.GMAIL_USER ? 'smtp.gmail.com' : null);
+      const smtpPort = Number(process.env.SMTP_PORT || 587);
+      const smtpEnabled = process.env.SMTP_ENABLED !== 'false';
+      this.easymailApiUrl = (process.env.EASYMAIL_API_URL || 'https://easymail-nu.vercel.app/api/v1/emails').replace(/\/$/, '');
+      this.easymailApiKey = process.env.EASYMAIL_API_KEY || null;
+      this.brevoApiKey = process.env.BREVO_API_KEY || null;
+      this.brevoSenderEmail = process.env.BREVO_SENDER_EMAIL || null;
+      this.brevoSenderName = process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'TSCS';
+
+      if (smtpEnabled && smtpHost && smtpUser && smtpPass) {
+        this.senderEmail = process.env.SMTP_FROM_EMAIL || smtpUser;
+        this.senderName = process.env.SMTP_FROM_NAME || process.env.EMAIL_FROM_NAME || 'TSCS';
+        this.transporter = nodemailer.createTransport({
+          host: smtpHost,
+          port: smtpPort,
+          secure: process.env.SMTP_SECURE === 'true' || smtpPort === 465,
+          auth: {
+            user: smtpUser,
+            pass: smtpPass
+          },
+          connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 10000),
+          greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT_MS || 10000),
+          socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT_MS || 20000)
+        });
+      }
+
+      this.isInitialized = Boolean(
+        this.easymailApiKey || this.transporter || (this.brevoApiKey && this.brevoSenderEmail)
+      );
+
+      if (!this.isInitialized) {
+        console.error('Email configuration incomplete: configure SMTP or the HTTPS email fallback');
         return;
       }
 
-      this.apiKey = process.env.BREVO_API_KEY;
-      this.senderEmail = process.env.BREVO_SENDER_EMAIL;
-      this.senderName = process.env.BREVO_SENDER_NAME || process.env.EMAIL_FROM_NAME || 'TSCS';
-
-      this.isInitialized = true;
-
-      console.log('Email service initialized with Brevo.');
+      console.log(`Email service initialized with ${this.easymailApiKey ? 'Easymail' : this.transporter ? 'SMTP' : 'HTTPS fallback'}.`);
     } catch (error) {
       console.error('Email service initialization failed:', error.message);
       this.isInitialized = false;
@@ -64,9 +105,12 @@ class EmailService {
       this.initialize();
     }
 
-    const canSendEmail = Boolean(this.apiKey && this.senderEmail);
+    const canUseEasymail = Boolean(this.easymailApiKey && this.easymailApiUrl);
+    const canUseSMTP = Boolean(this.transporter && this.senderEmail);
+    const canUseFallback = Boolean(this.brevoApiKey && this.brevoSenderEmail);
+    const canSendEmail = canUseEasymail || canUseSMTP || canUseFallback;
     if (!canSendEmail) {
-      console.error('Brevo email configuration incomplete: BREVO_API_KEY or BREVO_SENDER_EMAIL not set');
+      console.error('Email configuration is incomplete');
     }
 
     let logEntry = null;
@@ -74,28 +118,56 @@ class EmailService {
 
     if (canSendEmail) {
       // Create log entry first
-      logEntry = await EmailLog.logEmail({
-        email: options.to,
-        type: options.type || 'system_notification',
-        subject: options.subject,
-        status: 'pending',
-        metadata: options.metadata || {}
-      });
+      if (EmailLog.db.readyState === 1) {
+        logEntry = await EmailLog.logEmail({
+          email: options.to,
+          type: options.type || 'system_notification',
+          subject: options.subject,
+          status: 'pending',
+          metadata: options.metadata || {}
+        });
+      }
 
       try {
-        const payload = {
-          sender: { name: this.senderName, email: this.senderEmail },
-          to: [{ email: options.to }],
-          subject: options.subject,
-          htmlContent: options.html,
-          textContent: options.text || undefined
-        };
+        let providerResponse;
+        if (canUseEasymail) {
+          const info = await this.sendEasymailRequest({
+            to: options.to,
+            subject: options.subject,
+            html: options.html,
+            text: options.text || undefined
+          });
+          providerResponse = info.messageId || info.id || 'Easymail accepted';
+        } else if (canUseSMTP) {
+          try {
+            const info = await this.transporter.sendMail({
+              from: { name: this.senderName, address: this.senderEmail },
+              to: options.to,
+              subject: options.subject,
+              html: options.html,
+              text: options.text || undefined
+            });
+            providerResponse = info.response || info.messageId || 'SMTP accepted';
+          } catch (smtpError) {
+            if (!canUseFallback) throw smtpError;
+            console.warn('SMTP delivery unavailable; using configured HTTPS email fallback.');
+          }
+        }
 
-        const info = await this.sendBrevoRequest('/v3/smtp/email', 'POST', payload);
+        if (!providerResponse) {
+          const info = await this.sendBrevoRequest('/v3/smtp/email', 'POST', {
+            sender: { name: this.brevoSenderName, email: this.brevoSenderEmail },
+            to: [{ email: options.to }],
+            subject: options.subject,
+            htmlContent: options.html,
+            textContent: options.text || undefined
+          });
+          providerResponse = info.messageId || 'HTTPS email provider accepted';
+        }
 
         // Update log on success
         if (logEntry) {
-          await EmailLog.updateStatus(logEntry._id, 'sent', null, info.messageId || 'Brevo accepted');
+          await EmailLog.updateStatus(logEntry._id, 'sent', null, providerResponse);
         }
 
         if (process.env.NODE_ENV === 'development') {
@@ -103,7 +175,7 @@ class EmailService {
         }
         emailSent = true;
       } catch (error) {
-        const errorMessage = this.extractBrevoError(error) || error.message;
+        const errorMessage = error.response || error.message;
 
         if (logEntry) {
           await EmailLog.updateStatus(logEntry._id, 'failed', errorMessage);
@@ -145,6 +217,20 @@ class EmailService {
       type: 'email_verification_otp',
       phone,
       smsText: `TSCS verification code: ${otp}. Expires in 10 minutes.`
+    });
+  }
+
+  /**
+   * Send a privileged-login MFA code.
+   */
+  async sendMFAOTP(email, otp, userName) {
+    return await this.sendEmail({
+      to: email,
+      subject: 'Your TSCS login authentication code',
+      html: this.generateMFAOTPHTML(otp, userName),
+      text: this.generateMFAOTPText(otp, userName),
+      type: 'login_mfa_otp',
+      metadata: { purpose: 'privileged_login_mfa' }
     });
   }
 
@@ -493,6 +579,34 @@ If you didn't request this verification, please ignore this email.
 Teacher Submission Competition System (TSCS)
 This verification code was sent to complete your account setup.
     `.trim();
+  }
+
+  generateMFAOTPHTML(otp, userName) {
+    const safeUserName = escapeHTML(userName || 'TSCS user');
+    return `
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>TSCS Login Authentication Code</title>
+      </head>
+      <body style="margin:0;padding:24px;background:#f4f6f8;font-family:Arial,sans-serif;color:#1f2937;">
+        <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;padding:32px;border:1px solid #e5e7eb;">
+          <h1 style="margin:0 0 12px;font-size:24px;color:#173b57;">Confirm your TSCS login</h1>
+          <p>Hello ${safeUserName},</p>
+          <p>Use this one-time code to complete your administrator login:</p>
+          <div style="font-size:34px;font-weight:700;letter-spacing:8px;text-align:center;padding:18px;margin:24px 0;background:#eef6fb;border:1px dashed #2676a3;border-radius:8px;color:#173b57;">${otp}</div>
+          <p style="font-size:14px;color:#4b5563;">The code expires in 10 minutes and can only be used once. TSCS staff will never ask you to share it.</p>
+          <p style="font-size:14px;color:#b42318;">If you did not attempt to sign in, change your password and contact the system administrator immediately.</p>
+        </div>
+      </body>
+      </html>
+    `;
+  }
+
+  generateMFAOTPText(otp, userName) {
+    return `TSCS login authentication\n\nHello ${userName || 'TSCS user'},\n\nYour one-time login code is: ${otp}\n\nThis code expires in 10 minutes and can only be used once. Do not share it.\n\nIf you did not attempt to sign in, change your password and contact the system administrator immediately.`;
   }
 
   /**
@@ -1600,63 +1714,66 @@ This password reset was requested for your account security.
       this.initialize();
     }
 
-    if (!this.apiKey) {
+    if (!this.easymailApiKey && !this.transporter && !this.brevoApiKey) {
       return false;
     }
 
-    try {
-      await this.sendBrevoRequest('/v3/account', 'GET');
-      return true;
-    } catch (error) {
-      console.error('Email service connection test failed:', this.extractBrevoError(error) || error.message);
-      return false;
-    }
-  }
-
-  /**
-   * Extracts a readable message from Brevo errors
-   * @param {Error} error - error returned by Brevo SDK
-   * @returns {string|undefined}
-   */
-  extractBrevoError(error) {
-    if (!error) return undefined;
-    if (error.responseBody) {
-      if (typeof error.responseBody === 'string') {
-        try {
-          const parsed = JSON.parse(error.responseBody);
-          return parsed.message || parsed.code || error.message;
-        } catch (parseError) {
-          return error.responseBody;
-        }
-      }
-      if (typeof error.responseBody === 'object') {
-        return error.responseBody.message || error.responseBody.code;
+    if (this.easymailApiKey) {
+      try {
+        const response = await fetch('https://easymail-nu.vercel.app/api/health');
+        if (response.ok) return true;
+      } catch (error) {
+        console.error('Easymail connection test failed:', error.message);
       }
     }
-    return error.message;
+
+    if (this.transporter) {
+      try {
+        await this.transporter.verify();
+        return true;
+      } catch (error) {
+        console.error('SMTP connection test failed:', error.message);
+      }
+    }
+
+    if (this.brevoApiKey && this.brevoSenderEmail) {
+      try {
+        await this.sendBrevoRequest('/v3/account', 'GET');
+        return true;
+      } catch (error) {
+        console.error('HTTPS email fallback connection test failed:', error.message);
+      }
+    }
+
+    return false;
   }
 
-  /**
-   * Perform HTTPS request to Brevo API
-   * @param {string} path - API path (e.g., /v3/smtp/email)
-   * @param {string} method - HTTP method
-   * @param {Object} body - Optional JSON body
-   * @returns {Promise<Object>} Parsed response body
-   */
+  async sendEasymailRequest(body) {
+    const response = await fetch(this.easymailApiUrl, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.easymailApiKey}`,
+        'content-type': 'application/json',
+        'idempotency-key': randomUUID()
+      },
+      body: JSON.stringify(body)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || `Easymail request failed (${response.status})`);
+    }
+    return payload;
+  }
+
   async sendBrevoRequest(path, method, body) {
-    if (!this.apiKey) {
-      throw new Error('Brevo API key not configured');
-    }
-
     const payload = body ? JSON.stringify(body) : null;
-
     const options = {
       hostname: 'api.brevo.com',
       path,
       method,
       headers: {
         accept: 'application/json',
-        'api-key': this.apiKey
+        'api-key': this.brevoApiKey
       }
     };
 
@@ -1666,52 +1783,30 @@ This password reset was requested for your account security.
     }
 
     return new Promise((resolve, reject) => {
-      const req = https.request(options, (res) => {
+      const request = https.request(options, (response) => {
         let data = '';
-
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-
-        res.on('end', () => {
-          const isSuccess = res.statusCode >= 200 && res.statusCode < 300;
-          const parsed = this.safeJsonParse(data);
-
-          if (isSuccess) {
-            resolve(parsed);
-          } else {
-            const err = new Error(parsed?.message || `Brevo API error (${res.statusCode})`);
-            err.statusCode = res.statusCode;
-            err.responseBody = parsed || data;
-            reject(err);
+        response.on('data', (chunk) => { data += chunk; });
+        response.on('end', () => {
+          let parsed = {};
+          try {
+            parsed = data ? JSON.parse(data) : {};
+          } catch {
+            parsed = { message: data };
           }
+
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            resolve(parsed);
+            return;
+          }
+
+          reject(new Error(parsed.message || `Email provider error (${response.statusCode})`));
         });
       });
 
-      req.on('error', (error) => {
-        reject(error);
-      });
-
-      if (payload) {
-        req.write(payload);
-      }
-
-      req.end();
+      request.on('error', reject);
+      if (payload) request.write(payload);
+      request.end();
     });
-  }
-
-  /**
-   * Safely parse JSON responses
-   * @param {string} data
-   * @returns {Object|string|undefined}
-   */
-  safeJsonParse(data) {
-    if (!data) return {};
-    try {
-      return JSON.parse(data);
-    } catch (error) {
-      return data;
-    }
   }
 }
 

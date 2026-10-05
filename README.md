@@ -10,7 +10,8 @@ Backend API for the TSCS (Teacher Submission Competition System) built with Node
 - **Mongoose** - MongoDB object modeling
 - **JWT** - Authentication
 - **bcryptjs** - Password hashing
-- **Nodemailer** - Email sending (Gmail SMTP)
+- **Easymail** - Primary transactional email API
+- **Nodemailer/Brevo** - Optional delivery fallbacks
 - **express-rate-limit** - Rate limiting
 
 ## Prerequisites
@@ -45,6 +46,8 @@ NODE_ENV=development
 MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/tscs?retryWrites=true&w=majority
 JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
 CLIENT_URL=http://localhost:5173
+EASYMAIL_API_URL=https://easymail-nu.vercel.app/api/v1/emails
+EASYMAIL_API_KEY=gms_your_sender_bound_api_key
 ```
 
 ## Running the Server
@@ -167,10 +170,21 @@ Teacher registration now requires email verification:
 
 ### Email Notifications
 
+The backend sends email through the live Easymail HTTPS API. Keep
+`EASYMAIL_API_KEY` on the backend only; never expose it through the frontend or
+commit it to Git. The key must be bound to the TSCS sender in the TSCS Easymail
+workspace. Direct SMTP and Brevo remain optional fallbacks when configured.
+
+Test the integration locally with:
+
+```bash
+npm run email:test -- --to recipient@example.com
+```
+
 The system includes an event-driven notification system:
 
 - **In-app notifications**: Stored in database with read/unread status
-- **Email notifications**: Sent asynchronously using Gmail SMTP
+- **Email notifications**: Sent asynchronously through Easymail
 - **Event types**: USER_REGISTERED, SYSTEM_NOTIFICATION, competition events, etc.
 - **Templates**: Professional HTML templates for OTP verification and system notifications
 
@@ -203,4 +217,3 @@ tscs-backend/
 ## License
 
 ISC
-

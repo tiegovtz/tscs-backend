@@ -17,6 +17,10 @@ services:
         sync: false
       - key: CLIENT_URL
         sync: false
+      - key: EASYMAIL_API_URL
+        value: https://easymail-nu.vercel.app/api/v1/emails
+      - key: EASYMAIL_API_KEY
+        sync: false
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_SENDER_EMAIL

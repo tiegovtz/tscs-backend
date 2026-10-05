@@ -21,6 +21,8 @@ const emailLogSchema = new mongoose.Schema({
     required: true,
     enum: [
       'email_verification_otp',
+      'login_mfa_otp',
+      'manual_test',
       'system_notification',
       'password_reset_otp',
       'submission_successful',
