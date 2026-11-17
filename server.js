@@ -1,5 +1,6 @@
 const express = require("express");
 const http = require("http");
+const path = require("path");
 const compression = require('compression');
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -86,6 +87,14 @@ app.use(compression({
 
 // Initialize email service
 emailService.initialize();
+
+// Email clients fetch remote images independently of the frontend. Serve the
+// small, versioned brand and weekday hero assets from this public API origin.
+app.use("/email-assets", express.static(path.join(__dirname, "public", "email-assets"), {
+  maxAge: "1y",
+  immutable: true,
+  fallthrough: false,
+}));
 
 // Test email connection (silent in production, verbose in development)
 emailService.testConnection().catch((error) => {

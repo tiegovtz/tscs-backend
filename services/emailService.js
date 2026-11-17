@@ -12,6 +12,57 @@ const escapeHTML = (value) => String(value || '').replace(/[&<>'"]/g, (character
   '"': '&quot;'
 })[character]);
 
+const findDivByClass = (html, className) => {
+  const divTags = /<\/?div\b[^>]*>/gi;
+  let tagMatch;
+
+  while ((tagMatch = divTags.exec(html))) {
+    if (/^<\//.test(tagMatch[0])) continue;
+    const classes = tagMatch[0].match(/\bclass\s*=\s*["']([^"']+)["']/i)?.[1]?.split(/\s+/) || [];
+    if (!classes.includes(className)) continue;
+
+    let depth = 1;
+    let nestedMatch;
+    while ((nestedMatch = divTags.exec(html))) {
+      if (/^<\//.test(nestedMatch[0])) depth -= 1;
+      else if (!/\/\s*>$/.test(nestedMatch[0])) depth += 1;
+      if (depth === 0) {
+        const end = nestedMatch.index + nestedMatch[0].length;
+        return {
+          start: tagMatch.index,
+          end,
+          inner: html.slice(tagMatch.index + tagMatch[0].length, nestedMatch.index)
+        };
+      }
+    }
+    return null;
+  }
+
+  return null;
+};
+
+const unwrapDivClass = (html, className) => {
+  const block = findDivByClass(html, className);
+  return block ? `${html.slice(0, block.start)}${block.inner}${html.slice(block.end)}` : html;
+};
+
+const removeDivClass = (html, className) => {
+  let output = html;
+  let block = findDivByClass(output, className);
+  while (block) {
+    output = `${output.slice(0, block.start)}${output.slice(block.end)}`;
+    block = findDivByClass(output, className);
+  }
+  return output;
+};
+
+const getEmailAssetBaseUrl = () => (
+  process.env.EMAIL_PUBLIC_BASE_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  process.env.CLIENT_URL ||
+  ''
+).replace(/\/$/, '');
+
 /**
  * Email Service
  *
@@ -32,6 +83,171 @@ class EmailService {
     this.brevoSenderEmail = null;
     this.brevoSenderName = null;
     this.isInitialized = false;
+  }
+
+  getDailyEmailHero() {
+    const weekday = new Intl.DateTimeFormat('en-US', {
+      weekday: 'long',
+      timeZone: 'Africa/Dar_es_Salaam'
+    }).format(new Date()).toLowerCase();
+    const publicBaseUrl = getEmailAssetBaseUrl();
+
+    return {
+      weekday,
+      imageUrl: publicBaseUrl ? `${publicBaseUrl}/email-assets/${weekday}.jpg` : null
+    };
+  }
+
+  extractEmailMainContent(html) {
+    const body = String(html).match(/<body\b[^>]*>([\s\S]*?)<\/body>/i)?.[1] || String(html);
+    let content = unwrapDivClass(body, 'container');
+    content = unwrapDivClass(content, 'email-wrapper');
+    content = removeDivClass(content, 'footer');
+    ['warning-icon', 'admin-icon', 'critical-icon', 'success-icon', 'notification-icon'].forEach((className) => {
+      content = removeDivClass(content, className);
+    });
+    return content.trim();
+  }
+
+  applyEmailBrandLayout(html, type) {
+    if (!html || html.includes('data-tscs-email-layout')) return html;
+
+    const { weekday, imageUrl } = this.getDailyEmailHero();
+    const year = new Date().getFullYear();
+    const assetBaseUrl = getEmailAssetBaseUrl();
+    const baseUrl = (process.env.CLIENT_URL || assetBaseUrl).replace(/\/$/, '');
+    const ctaLabels = {
+      submission_successful: 'View your dashboard',
+      submission_promoted: 'View your dashboard',
+      submission_eliminated: 'View your results',
+      submission_disqualified: 'Review your submission',
+      evaluation_reminder: 'Continue evaluation',
+      evaluation_pending: 'Review pending evaluations',
+      judge_assigned: 'View assigned submission',
+      admin_notification: 'Open admin dashboard',
+      system_critical: 'Open admin dashboard'
+    };
+    const ctaLabel = ctaLabels[type];
+    const cta = ctaLabel && baseUrl
+      ? `<tr><td align="center" style="padding:8px 24px 28px;"><a class="tscs-email-cta" href="${baseUrl}/login" style="display:inline-block;padding:14px 24px;border-radius:8px;background:#54afe4;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:700;line-height:1.2;text-decoration:none;">${ctaLabel}</a></td></tr>`
+      : '';
+    const logoUrl = assetBaseUrl ? `${assetBaseUrl}/email-assets/tielogo.png` : null;
+    const brand = logoUrl
+      ? `<tr><td class="tscs-email-brand" style="padding:14px 28px;background:#ffffff;border-bottom:1px solid #e2e8f0;"><img src="${logoUrl}" width="42" height="52" alt="TIE" style="display:block;width:42px;height:52px;object-fit:contain;border:0;background:#ffffff;" /></td></tr>`
+      : `<tr><td height="8" class="tscs-email-brand" style="height:8px;background:#ffffff;border-bottom:1px solid #e2e8f0;font-size:0;line-height:0;">&nbsp;</td></tr>`;
+    const hero = imageUrl
+      ? `<tr><td style="padding:0;"><img src="${imageUrl}" width="680" alt="A TSCS classroom moment for ${weekday}" style="display:block;width:100%;max-width:680px;height:auto;border:0;" /></td></tr>`
+      : `<tr><td height="12" style="height:12px;background:#54afe4;font-size:0;line-height:0;">&nbsp;</td></tr>`;
+    const header = `<table class="tscs-email-canvas" data-tscs-email-layout="true" role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#eef3f7;"><tr><td class="tscs-email-canvas-cell" align="center" style="padding:24px 12px;background:#eef3f7;"><table class="tscs-email-frame" role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">${brand}${hero}<tr><td class="tscs-email-body" style="padding:0 10px;vertical-align:top;background:#ffffff;color:#1f2937;">`;
+    const footer = `</td></tr>${cta}<tr><td class="tscs-email-signoff" style="padding:0 28px 24px;background:#ffffff;color:#475569;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">Regards,<br /><strong style="color:#102b40;">The TSCS Team</strong></td></tr><tr><td class="tscs-email-footer" style="padding:17px 24px;background:#f6f8fa;border-top:1px solid #e2e8f0;color:#64748b;font-family:Arial,sans-serif;font-size:12px;line-height:1.5;text-align:center;">© ${year} Teaching Skills Competition System. All rights reserved.</td></tr></table></td></tr></table>`;
+    const layoutStyles = `
+      <style data-tscs-email-layout="true">
+        :root { color-scheme: light dark; supported-color-schemes: light dark; }
+        body { margin: 0 !important; padding: 0 !important; background: #eef3f7 !important; }
+        table { border-collapse: collapse; }
+        img { max-width: 100%; }
+        .tscs-email-frame, .tscs-email-body, .tscs-email-signoff { background-color: #ffffff !important; color: #1f2937 !important; }
+        .tscs-email-brand { background-color: #ffffff !important; color: #102b40 !important; border-bottom: 1px solid #e2e8f0; }
+        .tscs-email-brand a { color: #475569 !important; }
+        .tscs-email-footer { background-color: #f6f8fa !important; color: #64748b !important; }
+        .tscs-email-cta { background-color: #54afe4 !important; color: #ffffff !important; }
+        .tscs-email-copy { padding: 34px 36px 18px; font-family: Arial, sans-serif; font-size: 16px; line-height: 1.65; }
+        .tscs-email-copy .header { margin: 0 0 24px; color: #1f2937; text-align: left; }
+        .tscs-email-copy h1 { margin: 0 0 12px; color: #102b40; font-size: 28px; line-height: 1.25; }
+        .tscs-email-copy h2 { margin: 24px 0 10px; color: #102b40; font-size: 20px; line-height: 1.35; }
+        .tscs-email-copy h3 { color: #102b40; font-size: 17px; }
+        .tscs-email-copy p { margin: 0 0 16px; color: #334155; }
+        .tscs-email-copy a { color: #2676a3; }
+        .tscs-email-copy .otp-code { margin: 24px 0; padding: 18px; border: 2px dashed #54afe4; border-radius: 10px; background: #f1f8fc; color: #102b40; font-size: 32px; font-weight: 700; letter-spacing: 8px; text-align: center; }
+        .tscs-email-copy .warning, .tscs-email-copy .message, .tscs-email-copy .metadata,
+        .tscs-email-copy .content, .tscs-email-copy .deadline, .tscs-email-copy .results-box,
+        .tscs-email-copy .reason-box, .tscs-email-copy .details-box, .tscs-email-copy .instructions {
+          margin: 18px 0;
+          padding: 16px 18px;
+          border: 1px solid #dce6ee;
+          border-radius: 10px;
+          background: #f6f9fb;
+          color: #334155;
+        }
+        .tscs-email-copy .severity { display: inline-block; padding: 7px 14px; border-radius: 20px; background: #b42318; color: #ffffff; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+
+        @media only screen and (max-width: 600px) {
+          .tscs-email-canvas-cell { padding: 0 !important; }
+          .tscs-email-frame { border-radius: 0 !important; }
+          .tscs-email-body { padding: 0 !important; }
+          .tscs-email-copy { padding: 28px 22px 14px !important; font-size: 15px !important; }
+          .tscs-email-body .container, .tscs-email-body .email-wrapper {
+            box-sizing: border-box !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 24px 20px !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+          }
+        }
+
+        @media (prefers-color-scheme: dark) {
+          body, .tscs-email-canvas, .tscs-email-canvas-cell {
+            background-color: #101820 !important;
+            color: #e8edf4 !important;
+          }
+          .tscs-email-frame { background-color: #151c24 !important; border-color: #2b3642 !important; }
+          .tscs-email-brand { background-color: #111820 !important; color: #f5f8fb !important; border-color: #2b3642 !important; }
+          .tscs-email-brand a { color: #cbd5df !important; }
+          .tscs-email-body, .tscs-email-body .container, .tscs-email-body .email-wrapper,
+          .tscs-email-body .content, .tscs-email-body .warning, .tscs-email-body .results-box,
+          .tscs-email-body .reason-box, .tscs-email-body .deadline, .tscs-email-body .assignment-section,
+          .tscs-email-body .instructions, .tscs-email-body [style*="background:#fff"],
+          .tscs-email-body [style*="background: white"] {
+            background-color: #151c24 !important;
+            border-color: #2b3642 !important;
+            color: #e8edf4 !important;
+            box-shadow: none !important;
+          }
+          .tscs-email-body p, .tscs-email-body h1, .tscs-email-body h2, .tscs-email-body h3,
+          .tscs-email-body li, .tscs-email-body .greeting { color: #e8edf4 !important; }
+          .tscs-email-copy .header, .tscs-email-copy h1, .tscs-email-copy h2, .tscs-email-copy h3,
+          .tscs-email-copy p { color: #e8edf4 !important; }
+          .tscs-email-body a { color: #7bc4ed !important; }
+          .tscs-email-body .otp-code, .tscs-email-body .message, .tscs-email-body .metadata,
+          .tscs-email-body .details-box {
+            background-color: #202a35 !important;
+            border-color: #3a4856 !important;
+            color: #e8edf4 !important;
+          }
+          .tscs-email-copy .otp-code, .tscs-email-copy .warning, .tscs-email-copy .message,
+          .tscs-email-copy .metadata, .tscs-email-copy .content, .tscs-email-copy .deadline,
+          .tscs-email-copy .results-box, .tscs-email-copy .reason-box, .tscs-email-copy .details-box,
+          .tscs-email-copy .instructions { background-color: #202a35 !important; border-color: #3a4856 !important; color: #e8edf4 !important; }
+          .tscs-email-body .footer { border-color: #2b3642 !important; color: #aab6c2 !important; }
+          .tscs-email-signoff { background-color: #151c24 !important; color: #cbd5df !important; }
+          .tscs-email-signoff strong { color: #f5f8fb !important; }
+          .tscs-email-footer { background-color: #111820 !important; border-color: #2b3642 !important; color: #aab6c2 !important; }
+        }
+
+        [data-ogsc] .tscs-email-frame, [data-ogsc] .tscs-email-body, [data-ogsc] .tscs-email-signoff {
+          background-color: #151c24 !important;
+          color: #e8edf4 !important;
+        }
+        [data-ogsc] .tscs-email-footer { background-color: #111820 !important; color: #aab6c2 !important; }
+      </style>`;
+
+    const content = this.extractEmailMainContent(html);
+    let output = String(html).replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '');
+    output = output.replace(
+      /<body\b[^>]*>[\s\S]*?<\/body>/i,
+      `<body style="margin:0;padding:0;background:#eef3f7;">${header}<div class="tscs-email-copy">${content}</div>${footer}</body>`
+    );
+    if (output === html) return html;
+    output = output.replace(/<\/head>/i, `<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">${layoutStyles}</head>`);
+    return output;
+  }
+
+  appendEmailTextFooter(text) {
+    if (!text || text.includes('All rights reserved.')) return text;
+    const year = new Date().getFullYear();
+    return `${String(text).trim()}\n\nRegards,\nThe TSCS Team\n\n© ${year} Teaching Skills Competition System. All rights reserved.`;
   }
 
   /**
@@ -112,6 +328,9 @@ class EmailService {
     if (!canSendEmail) {
       console.error('Email configuration is incomplete');
     }
+
+    options.html = this.applyEmailBrandLayout(options.html, options.type);
+    options.text = this.appendEmailTextFooter(options.text);
 
     let logEntry = null;
     let emailSent = false;
